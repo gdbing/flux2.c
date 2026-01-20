@@ -166,7 +166,30 @@ Other targets:
 ```bash
 make clean      # Clean build artifacts
 make info       # Show available backends for this platform
-make test       # Run reference image test
+```
+
+## Testing
+
+Run the test suite to verify your build produces correct output:
+
+```bash
+make test        # Run all tests (64x64 and 512x512)
+make test-quick  # Run only the quick 64x64 test
+```
+
+The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is ≤2 (to allow for minor floating-point variations across platforms).
+
+**Test cases:**
+| Test | Size | Steps | Purpose |
+|------|------|-------|---------|
+| Quick | 64×64 | 2 | Fast sanity check (~20s) |
+| Full | 512×512 | 4 | Validates larger resolutions (~40s) |
+
+You can also run the test script directly for more options:
+```bash
+python3 run_test.py --help
+python3 run_test.py --quick          # Quick test only
+python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
 ```
 
 ## Model Download

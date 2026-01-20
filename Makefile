@@ -123,20 +123,11 @@ debug: clean $(TARGET)
 # =============================================================================
 # Test and utilities
 # =============================================================================
-TEST_PROMPT = "A fluffy orange cat sitting on a windowsill"
 test:
-	@echo "Running inference test..."
-	@./$(TARGET) -d flux-klein-model -p $(TEST_PROMPT) --seed 42 --steps 1 -o /tmp/flux_test_output.png -W 64 -H 64
-	@python3 -c "\
-import numpy as np; \
-from PIL import Image; \
-ref = np.array(Image.open('test_vectors/reference_1step_64x64_seed42.png')); \
-test = np.array(Image.open('/tmp/flux_test_output.png')); \
-diff = np.abs(ref.astype(float) - test.astype(float)); \
-print(f'Max diff: {diff.max()}, Mean diff: {diff.mean():.4f}'); \
-exit(0 if diff.max() < 2 else 1)"
-	@rm -f /tmp/flux_test_output.png
-	@echo "TEST PASSED"
+	@python3 run_test.py --flux-binary ./$(TARGET)
+
+test-quick:
+	@python3 run_test.py --flux-binary ./$(TARGET) --quick
 
 pngtest:
 	@echo "Running PNG compression compare test..."
