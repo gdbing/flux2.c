@@ -176,17 +176,18 @@ make info       # Show available backends for this platform
 Run the test suite to verify your build produces correct output:
 
 ```bash
-make test        # Run all tests (64x64 and 512x512)
+make test        # Run all 3 tests
 make test-quick  # Run only the quick 64x64 test
 ```
 
-The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is ≤2 (to allow for minor floating-point variations across platforms).
+The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).
 
 **Test cases:**
 | Test | Size | Steps | Purpose |
 |------|------|-------|---------|
-| Quick | 64×64 | 2 | Fast sanity check (~20s) |
-| Full | 512×512 | 4 | Validates larger resolutions (~40s) |
+| Quick | 64×64 | 2 | Fast txt2img sanity check |
+| Full | 512×512 | 4 | Validates txt2img at larger resolution |
+| img2img | 256×256 | 4 | Validates image-to-image transformation |
 
 You can also run the test script directly for more options:
 ```bash
