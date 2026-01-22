@@ -43,16 +43,15 @@ def main():
     print(f"Output dir: {output_dir}")
     print()
 
-    # Files to download - VAE, transformer, and text encoder
+    # Files to download - VAE, transformer, and Qwen3 text encoder
+    # Note: text_encoder_2 and tokenizer_2 are not used by the C implementation
     patterns = [
         "vae/*.safetensors",
         "vae/*.json",
         "transformer/*.safetensors",
         "transformer/*.json",
         "text_encoder/*",
-        "text_encoder_2/*",
         "tokenizer/*",
-        "tokenizer_2/*",
     ]
 
     print("Downloading files (~16GB total)...")
@@ -74,7 +73,7 @@ def main():
         # Show file sizes
         vae_path = output_dir / "vae" / "diffusion_pytorch_model.safetensors"
         tf_path = output_dir / "transformer" / "diffusion_pytorch_model.safetensors"
-        te_path = output_dir / "text_encoder_2"
+        te_path = output_dir / "text_encoder"
 
         total_size = 0
         if vae_path.exists():
