@@ -42,6 +42,7 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 - **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
+- **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256×256, then render at 512×512 with the same seed
 - **Terminal image display**: watch the resulting image without leaving your terminal (Only with Ghostty / Kitty).
 
 ### Terminal Image Display

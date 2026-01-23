@@ -478,16 +478,52 @@ float *flux_sample_heun(void *transformer,
 /*
  * Initialize latent noise for generation.
  * For rectified flow, we start from pure noise (t=1).
+ *
+ * Size-independent noise: We generate noise at max latent size (112x112)
+ * and subsample to target size. This ensures the same seed produces
+ * similar compositions at different resolutions.
  */
+#define NOISE_MAX_LATENT_DIM 112  /* 1792/16 = 112 */
+
 float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed) {
-    int size = batch * channels * h * w;
-    float *noise = (float *)malloc(size * sizeof(float));
+    int target_size = batch * channels * h * w;
+    float *noise = (float *)malloc(target_size * sizeof(float));
 
     if (seed >= 0) {
         flux_rng_seed((uint64_t)seed);
     }
 
-    flux_randn(noise, size);
+    /* If target is max size or larger, just generate directly */
+    if (h >= NOISE_MAX_LATENT_DIM && w >= NOISE_MAX_LATENT_DIM) {
+        flux_randn(noise, target_size);
+        return noise;
+    }
+
+    /* Generate noise at max latent size */
+    int max_h = NOISE_MAX_LATENT_DIM;
+    int max_w = NOISE_MAX_LATENT_DIM;
+    int max_size = batch * channels * max_h * max_w;
+    float *max_noise = (float *)malloc(max_size * sizeof(float));
+    flux_randn(max_noise, max_size);
+
+    /* Subsample to target size using nearest-neighbor */
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < channels; c++) {
+            for (int ty = 0; ty < h; ty++) {
+                for (int tx = 0; tx < w; tx++) {
+                    /* Map target position to source position */
+                    int sy = ty * max_h / h;
+                    int sx = tx * max_w / w;
+
+                    int src_idx = ((b * channels + c) * max_h + sy) * max_w + sx;
+                    int dst_idx = ((b * channels + c) * h + ty) * w + tx;
+                    noise[dst_idx] = max_noise[src_idx];
+                }
+            }
+        }
+    }
+
+    free(max_noise);
     return noise;
 }
 
