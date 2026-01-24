@@ -469,6 +469,12 @@ static void cmd_load(char *arg) {
     state.height = img->height;
 
     printf("Loaded: %s (%dx%d, ref $%d)\n", arg, img->width, img->height, ref_id);
+
+    /* Display in Kitty-capable terminal */
+    if (state.show_enabled) {
+        kitty_display_image(img);
+    }
+
     flux_image_free(img);
 }
 
