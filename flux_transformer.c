@@ -488,6 +488,80 @@ static void free_single_block_weights(single_block_t *b) {
     b->proj_mlp_weight_bf16 = NULL;
 }
 
+#ifdef USE_METAL
+/* Pre-warm bf16 weight buffer cache for all blocks (mmap mode).
+ * Loads each block's bf16 mmap pointers and copies weight data to Metal
+ * GPU buffers so the first denoising step doesn't pay the cache-miss cost. */
+static void warmup_mmap_bf16_buffers(flux_transformer_t *tf) {
+    if (!tf->use_mmap || !tf->use_bf16) return;
+
+    int h = tf->hidden_size, mlp = tf->mlp_hidden;
+    int fused = h * 3 + mlp * 2;
+
+    /* Input/output projections (already loaded) */
+    if (tf->img_in_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->img_in_weight_bf16,
+                                       (size_t)tf->latent_channels * h);
+    if (tf->txt_in_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->txt_in_weight_bf16,
+                                       (size_t)tf->text_dim * h);
+    if (tf->final_proj_weight_bf16)
+        flux_metal_warmup_bf16_buffer(tf->final_proj_weight_bf16,
+                                       (size_t)tf->latent_channels * h);
+
+    /* Double blocks */
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        load_double_block_weights(&tf->double_blocks[i], tf->sf, i, h, mlp, 1);
+        double_block_t *b = &tf->double_blocks[i];
+
+        if (b->img_q_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_q_weight_bf16, (size_t)h*h);
+        if (b->img_k_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_k_weight_bf16, (size_t)h*h);
+        if (b->img_v_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_v_weight_bf16, (size_t)h*h);
+        if (b->img_proj_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_proj_weight_bf16, (size_t)h*h);
+        if (b->img_mlp_gate_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_gate_weight_bf16, (size_t)mlp*h);
+        if (b->img_mlp_up_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_up_weight_bf16, (size_t)mlp*h);
+        if (b->img_mlp_down_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->img_mlp_down_weight_bf16, (size_t)h*mlp);
+
+        if (b->txt_q_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_q_weight_bf16, (size_t)h*h);
+        if (b->txt_k_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_k_weight_bf16, (size_t)h*h);
+        if (b->txt_v_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_v_weight_bf16, (size_t)h*h);
+        if (b->txt_proj_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_proj_weight_bf16, (size_t)h*h);
+        if (b->txt_mlp_gate_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_gate_weight_bf16, (size_t)mlp*h);
+        if (b->txt_mlp_up_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_up_weight_bf16, (size_t)mlp*h);
+        if (b->txt_mlp_down_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->txt_mlp_down_weight_bf16, (size_t)h*mlp);
+
+        free_double_block_weights(&tf->double_blocks[i]);
+    }
+
+    /* Single blocks */
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        load_single_block_weights(&tf->single_blocks[i], tf->sf, i, h, mlp, 1);
+        single_block_t *b = &tf->single_blocks[i];
+
+        if (b->qkv_mlp_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->qkv_mlp_weight_bf16, (size_t)fused*h);
+        if (b->proj_mlp_weight_bf16)
+            flux_metal_warmup_bf16_buffer(b->proj_mlp_weight_bf16, (size_t)h*(h+mlp));
+
+        free_single_block_weights(&tf->single_blocks[i]);
+    }
+}
+#endif
+
 /* ========================================================================
  * RoPE (Rotary Position Embeddings)
  * ======================================================================== */
@@ -4729,6 +4803,13 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
         flux_transformer_free(tf);
         return NULL;
     }
+
+#ifdef USE_METAL
+    /* Pre-warm bf16 weight buffer cache: copy all block weights from mmap
+     * to Metal GPU buffers. This shifts ~1s of first-step overhead to model
+     * loading, making all denoising steps consistently fast. */
+    warmup_mmap_bf16_buffers(tf);
+#endif
 
     return tf;
 }

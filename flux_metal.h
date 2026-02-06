@@ -628,6 +628,14 @@ int flux_metal_shaders_available(void);
  */
 void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 
+/*
+ * Pre-warm the bf16 buffer cache for a weight tensor.
+ * Copies bf16 data to a Metal GPU buffer so the first matmul call doesn't
+ * pay the buffer creation cost.
+ */
+void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements);
+
+
 /* ========================================================================
  * Native BF16 Pipeline API
  *

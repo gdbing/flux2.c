@@ -1008,6 +1008,11 @@ void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
     (void)get_cached_bf16_as_f16_buffer(bf16_weights, num_elements);
 }
 
+void flux_metal_warmup_bf16_buffer(const uint16_t *bf16_weights, size_t num_elements) {
+    if (!g_initialized || !bf16_weights || num_elements == 0) return;
+    (void)get_cached_bf16_buffer(bf16_weights, num_elements);
+}
+
 /*
  * BF16 matrix multiplication: C = alpha * A @ B + beta * C
  * A is f32, B is bf16 (weights, converted to f16 for MPS), C is f32
@@ -5838,3 +5843,4 @@ int flux_metal_attention_fused(float *out,
         return 1;  /* Success */
     }
 }
+
