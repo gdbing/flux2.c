@@ -256,7 +256,7 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         }
 
         /* Step image callback - decode and display intermediate result */
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -351,7 +351,7 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
         }
 
         /* Step image callback - decode and display intermediate result */
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -421,7 +421,7 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
         if (progress_callback)
             progress_callback(step + 1, num_steps);
 
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -506,7 +506,7 @@ float *flux_sample_euler_cfg(void *transformer, void *text_encoder,
         if (progress_callback)
             progress_callback(step + 1, num_steps);
 
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -587,7 +587,7 @@ float *flux_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
         if (progress_callback)
             progress_callback(step + 1, num_steps);
 
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -667,7 +667,7 @@ float *flux_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
         if (progress_callback)
             progress_callback(step + 1, num_steps);
 
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -734,7 +734,7 @@ float *flux_sample_euler_ancestral(void *transformer,
         }
 
         /* Step image callback - decode and display intermediate result */
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
@@ -806,7 +806,7 @@ float *flux_sample_heun(void *transformer,
         }
 
         /* Step image callback - decode and display intermediate result */
-        if (flux_step_image_callback && flux_step_image_vae) {
+        if (flux_step_image_callback && flux_step_image_vae && step + 1 < num_steps) {
             flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
                                               z_curr, 1, h, w);
             if (img) {
