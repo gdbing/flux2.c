@@ -322,20 +322,20 @@ The distilled model downloads to `./flux-klein-model`, the base model to `./flux
 
 Benchmarks on **Apple M3 Max** (128GB RAM), distilled model (4 steps).
 
-The MPS implementation matches the PyTorch optimized pipeline performance, providing better speed for small image sizes.
+The MPS implementation is faster than the PyTorch optimized pipeline at all resolutions.
 
 | Size | C (MPS) | PyTorch (MPS) |
 |------|---------|---------------|
-| 256x256 | 5.6s | 11s |
-| 512x512 | 9.1s | 13s |
-| 1024x1024 | 26s | 25s |
+| 256x256 | 5.2s | 11s |
+| 512x512 | 7.6s | 13s |
+| 1024x1024 | 19s | 25s |
 
 **Notes:**
 - All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
 - The base model is roughly 25x slower (50 steps × 2 passes per step vs 4 steps × 1 pass). It actually produces acceptable results even with 10 steps, so you can tune quality/time. The 25x figure is not exactly accurate because it only covers the denoising steps: text encoding and VAE use the same time for both the models, however such steps are a minor percentage of the generation time.
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
-- The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14 seconds!
+- The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
 ## Resolution Limits
 
