@@ -337,6 +337,20 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
+### Community Benchmarks
+
+The following timings for 512x512 generation (distilled model, 4 steps) were reported by users of Flux2.c. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
+
+| Hardware | Backend | 512x512 |
+|----------|---------|---------|
+| M3 Ultra | MPS | 4.5s |
+| M3 Max | MPS | 7.6s |
+| MacBook Pro M4 | MPS | 19s |
+| MacBook Pro M1 Max | MPS | 39.9s |
+| Apple M1 Pro | MPS | 42.4s |
+| AMD Ryzen 7800X3D | BLAS | 47.8s |
+| Intel i5-1135G7 | BLAS | 218s |
+
 ## Resolution Limits
 
 **Maximum resolution**: 1792x1792 pixels. The model produces good results up to this size; beyond this resolution image quality degrades significantly (this is a model limitation, not an implementation issue).
