@@ -404,28 +404,15 @@ void flux_conv2d(float *out, const float *in, const float *weight, const float *
              * where K = in_ch * kH * kW */
             int K = in_ch * kH * kW;
 
-            /* Allocate temporary contiguous buffer for tile output */
-            float *tmp = malloc((size_t)out_ch * tile_pixels * sizeof(float));
-            if (!tmp) {
-                free(col);
-                goto naive_fallback;
-            }
-
-            /* sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels] */
+            /* Write sgemm output directly to out_b using strided ldc.
+             * Row oc of sgemm output goes to out_b[oc * outH*outW + tile_start*outW],
+             * which is exactly the right position in NCHW layout. */
+            float *out_tile = out_b + tile_start * outW;
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         out_ch, tile_pixels, K,
                         1.0f, weight, K,
                         col, tile_pixels,
-                        0.0f, tmp, tile_pixels);
-
-            /* Scatter tile output to correct positions in out_b */
-            for (int oc = 0; oc < out_ch; oc++) {
-                float *out_tile = out_b + oc * outH * outW + tile_start * outW;
-                float *tmp_row = tmp + oc * tile_pixels;
-                memcpy(out_tile, tmp_row, tile_pixels * sizeof(float));
-            }
-
-            free(tmp);
+                        0.0f, out_tile, outH * outW);
         }
 
         /* Add bias */
