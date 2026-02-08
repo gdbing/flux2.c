@@ -37,10 +37,7 @@ if [ -z "$TOKEN" ] && [ -f "hf_token.txt" ]; then
     TOKEN=$(cat hf_token.txt | tr -d '[:space:]')
 fi
 
-# Set up auth header if token is available
-AUTH_HEADER=""
 if [ -n "$TOKEN" ]; then
-    AUTH_HEADER="-H \"Authorization: Bearer $TOKEN\""
     echo "Using authentication token"
 fi
 
@@ -51,9 +48,9 @@ BASE="https://huggingface.co/black-forest-labs/$REPO/resolve/main"
 # Helper function to download with optional auth
 dl() {
     if [ -n "$TOKEN" ]; then
-        curl -L -H "Authorization: Bearer $TOKEN" -o "$1" "$2"
+        curl -fL -H "Authorization: Bearer $TOKEN" -o "$1" "$2"
     else
-        curl -L -o "$1" "$2"
+        curl -fL -o "$1" "$2"
     fi
     # Check for auth errors
     if [ $? -ne 0 ]; then
@@ -107,7 +104,30 @@ dl "$OUT/tokenizer/vocab.json" "$BASE/tokenizer/vocab.json"
 
 # transformer
 dl "$OUT/transformer/config.json" "$BASE/transformer/config.json"
-dl "$OUT/transformer/diffusion_pytorch_model.safetensors" "$BASE/transformer/diffusion_pytorch_model.safetensors"
+
+# Try to download transformer index (sharded models like 9B)
+# Fall back to single file for non-sharded models (4B)
+TF_INDEX="$OUT/transformer/diffusion_pytorch_model.safetensors.index.json"
+curl -fL ${TOKEN:+-H "Authorization: Bearer $TOKEN"} -o "$TF_INDEX" \
+    "$BASE/transformer/diffusion_pytorch_model.safetensors.index.json" 2>/dev/null
+
+if [ -f "$TF_INDEX" ]; then
+    # Sharded: discover and download all shards
+    TF_SHARDS=$(python3 -c "
+import json
+with open('$TF_INDEX') as f:
+    idx = json.load(f)
+shards = sorted(set(idx['weight_map'].values()))
+for s in shards:
+    print(s)
+" 2>/dev/null)
+    for shard in $TF_SHARDS; do
+        dl "$OUT/transformer/$shard" "$BASE/transformer/$shard"
+    done
+else
+    # Single file (4B distilled/base)
+    dl "$OUT/transformer/diffusion_pytorch_model.safetensors" "$BASE/transformer/diffusion_pytorch_model.safetensors"
+fi
 
 # vae (~168 MB)
 dl "$OUT/vae/config.json" "$BASE/vae/config.json"

@@ -418,14 +418,16 @@ static int open_transformer_shards(const char *model_dir,
             }
             free(json);
 
-            /* Open each shard */
+            /* Open each shard - all must succeed */
             for (int i = 0; i < num_shards; i++) {
                 snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, shard_names[i]);
                 files[num_files] = safetensors_open(path);
                 if (files[num_files]) {
                     num_files++;
                 } else {
-                    fprintf(stderr, "Warning: failed to open shard %s\n", shard_names[i]);
+                    fprintf(stderr, "Error: failed to open transformer shard %s\n", shard_names[i]);
+                    for (int j = 0; j < num_files; j++) safetensors_close(files[j]);
+                    return 0;
                 }
             }
             if (num_files > 0) return num_files;

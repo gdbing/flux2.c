@@ -129,7 +129,7 @@ def main():
             print(f"  Total:        {total_size / 1024 / 1024 / 1024:.2f} GB")
         print()
         print("Usage:")
-        print(f"  ./flux2 -d {output_dir} -p \"your prompt\" -o output.png")
+        print(f"  ./flux -d {output_dir} -p \"your prompt\" -o output.png")
         print()
 
     except Exception as e:
