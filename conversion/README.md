@@ -57,5 +57,7 @@ Exit codes:
   is available.
 - Large outputs (for example 9B) may be saved as sharded safetensors with
   `diffusion_pytorch_model.safetensors.index.json` plus multiple shard files.
+- Comfy FP8 checkpoints (with keys like `.comfy_quant`, `.input_scale`,
+  `.weight_scale`, `.weight_scale_2`) are normalized automatically during conversion.
 - If conversion succeeds but key check still fails, the checkpoint likely uses a
   variant schema that still needs a post-conversion remap.
