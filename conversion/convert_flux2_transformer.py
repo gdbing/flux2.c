@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
+from statistics import median
 from pathlib import Path
 
 import torch
@@ -29,6 +31,19 @@ except ImportError as exc:
 
 DEFAULT_CONFIG_4B = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_CONFIG_9B = "black-forest-labs/FLUX.2-klein-9B"
+
+
+@dataclass
+class NormalizationReport:
+    removed_comfy: int = 0
+    removed_input_scale: int = 0
+    removed_weight_scale: int = 0
+    removed_weight_scale_2: int = 0
+    dequantized_fp8_weights: int = 0
+    dequantized_nvfp4_weights: int = 0
+    dequantized_uint8_weights: int = 0
+    cast_unscaled_fp8_tensors: int = 0
+    nvfp4_weight_keys: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +73,14 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         choices=("float32", "float16", "bfloat16"),
         help="Dtype used for loading/saving (default: %(default)s)",
+    )
+    p.add_argument(
+        "--verify-nvfp4",
+        action="store_true",
+        help=(
+            "Run strict sanity checks for decoded NVFP4 weights and abort if "
+            "statistics look suspicious."
+        ),
     )
     return p.parse_args()
 
@@ -90,29 +113,79 @@ def _float8_dtypes() -> set[torch.dtype]:
     return out
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _from_blocked(blocked_matrix: torch.Tensor, num_rows: int, num_cols: int) -> torch.Tensor:
+    """
+    Reverse cuBLAS 32_4_4 swizzled layout used for NVFP4 block scales.
+    Adapted from Comfy Kitchen's reference implementation.
+    """
+    n_row_blocks = _ceil_div(num_rows, 128)
+    n_col_blocks = _ceil_div(num_cols, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    step1 = blocked_matrix.reshape(-1, 32, 16)
+    step2 = step1.reshape(-1, 32, 4, 4).transpose(1, 2)
+    step3 = step2.reshape(n_row_blocks, n_col_blocks, 4, 32, 4)
+    step4 = step3.reshape(n_row_blocks, n_col_blocks, 128, 4)
+    step5 = step4.permute(0, 2, 1, 3)
+    unblocked = step5.reshape(padded_rows, padded_cols)
+    return unblocked[:num_rows, :num_cols]
+
+
+def _dequantize_nvfp4_weight(
+    packed_weight: torch.Tensor,
+    block_scales: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Decode Comfy NVFP4 weights (E2M1 FP4 packed x2) into dense float tensors.
+    """
+    # FP4 E2M1 lookup table used by Comfy/PyTorch AO.
+    # Indices 0-7 are positive values, 8-15 are negative counterparts.
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=output_dtype,
+        device=packed_weight.device,
+    ).unsqueeze(1)
+
+    lo = packed_weight & 0x0F
+    hi = packed_weight >> 4
+    unpacked_nibbles = torch.stack([hi, lo], dim=-1).view(*packed_weight.shape[:-1], -1)
+    fp4_values = torch.nn.functional.embedding(unpacked_nibbles.int(), lut).squeeze(-1)
+
+    rows, cols = fp4_values.shape
+    block_size = 16
+    fp4_values_blocked = fp4_values.reshape(rows, -1, block_size)
+    num_blocks_per_row = cols // block_size
+
+    unswizzled_scales = _from_blocked(block_scales, num_rows=rows, num_cols=num_blocks_per_row)
+    total_scale = per_tensor_scale.to(output_dtype) * unswizzled_scales.to(output_dtype)
+    dequantized = fp4_values_blocked * total_scale.unsqueeze(-1)
+    return dequantized.reshape(rows, cols).to(output_dtype)
+
+
 def _normalize_checkpoint_for_diffusers(
     checkpoint: dict[str, object], *, target_dtype: torch.dtype
-) -> dict[str, object]:
+) -> tuple[dict[str, object], NormalizationReport]:
     checkpoint = _strip_prefix_if_present(checkpoint, "model.diffusion_model.")
     fp8_types = _float8_dtypes()
     scale_suffix = "_scale"
     scale2_suffix = "_scale_2"
-    removed_comfy = 0
-    removed_input_scale = 0
-    removed_weight_scale = 0
-    removed_weight_scale_2 = 0
-    dequantized_weights = 0
-    dequantized_uint8_weights = 0
-    cast_fp8_without_scale = 0
+    report = NormalizationReport()
 
     # Remove Comfy-specific metadata keys that Diffusers does not understand.
     for key in list(checkpoint.keys()):
         if key.endswith(".comfy_quant"):
             checkpoint.pop(key)
-            removed_comfy += 1
+            report.removed_comfy += 1
         elif key.endswith(".input_scale"):
             checkpoint.pop(key)
-            removed_input_scale += 1
+            report.removed_input_scale += 1
 
     # Fold quantization scales into `*.weight` tensors for Comfy checkpoints.
     for key in [k for k in checkpoint.keys() if k.endswith(".weight")]:
@@ -140,67 +213,77 @@ def _normalize_checkpoint_for_diffusers(
 
             checkpoint[key] = dequantized.to(target_dtype)
             checkpoint.pop(scale_key, None)
-            removed_weight_scale += 1
+            report.removed_weight_scale += 1
             if scale2_key in checkpoint:
                 checkpoint.pop(scale2_key, None)
-                removed_weight_scale_2 += 1
-            dequantized_weights += 1
+                report.removed_weight_scale_2 += 1
+            report.dequantized_fp8_weights += 1
             continue
 
         # Variant 2: UINT8 packed weights with group scales and optional extra scalar scale.
         if weight.dtype == torch.uint8 and isinstance(scale, torch.Tensor):
-            w = weight.to(torch.float32)
+            is_nvfp4 = False
             s = scale.to(dtype=torch.float32, device=weight.device)
             dequantized: torch.Tensor | None = None
 
-            # Comfy packed-4bit path: uint8 stores two 4-bit values per byte.
+            # Comfy NVFP4 packed path: uint8 stores two FP4 (E2M1) values per byte,
+            # with per-tensor scale (`weight_scale_2`) and swizzled block scales.
             if (
                 isinstance(scale2, torch.Tensor)
-                and w.ndim == 2
+                and weight.ndim == 2
                 and s.ndim == 2
-                and s.shape[0] == w.shape[0]
+                and s.shape[0] == weight.shape[0]
                 and s.shape[1] > 0
-                and (w.shape[1] * 2) % s.shape[1] == 0
+                and scale.dtype in fp8_types
             ):
-                low = (weight & 0x0F).to(torch.float32)
-                high = (weight >> 4).to(torch.float32)
-                unpacked = torch.empty(
-                    (w.shape[0], w.shape[1] * 2), dtype=torch.float32, device=weight.device
-                )
-                unpacked[:, 0::2] = low
-                unpacked[:, 1::2] = high
-                group_size = unpacked.shape[1] // s.shape[1]
-                expanded_scale = s.repeat_interleave(group_size, dim=1)
-                dequantized = (unpacked - 8.0) * expanded_scale
-            elif s.shape == w.shape:
-                dequantized = ((w - 128.0) / 127.0) * s
-            elif w.ndim == 2 and s.ndim == 2 and s.shape[0] == w.shape[0] and s.shape[1] > 0:
-                if w.shape[1] % s.shape[1] == 0:
-                    group_size = w.shape[1] // s.shape[1]
-                    expanded_scale = s.repeat_interleave(group_size, dim=1)
-                    dequantized = ((w - 128.0) / 127.0) * expanded_scale
+                # Heuristic sanity check for NVFP4 block geometry:
+                # unpacked columns must be divisible by 16 and match 1x16 block scales.
+                unpacked_cols = weight.shape[1] * 2
+                if unpacked_cols % 16 == 0:
+                    dequantized = _dequantize_nvfp4_weight(
+                        packed_weight=weight,
+                        block_scales=scale,
+                        per_tensor_scale=scale2,
+                        output_dtype=target_dtype,
+                    )
+                    is_nvfp4 = True
+                    report.dequantized_nvfp4_weights += 1
+                    report.nvfp4_weight_keys.append(key)
 
-            if dequantized is not None:
-                if isinstance(scale2, torch.Tensor):
+            # Fallback path for non-NVFP4 uint8 schemes (best-effort).
+            if dequantized is None:
+                w = weight.to(torch.float32)
+                if s.shape == w.shape:
+                    dequantized = ((w - 128.0) / 127.0) * s
+                elif w.ndim == 2 and s.ndim == 2 and s.shape[0] == w.shape[0] and s.shape[1] > 0:
+                    if w.shape[1] % s.shape[1] == 0:
+                        group_size = w.shape[1] // s.shape[1]
+                        expanded_scale = s.repeat_interleave(group_size, dim=1)
+                        dequantized = ((w - 128.0) / 127.0) * expanded_scale
+
+                if dequantized is not None and isinstance(scale2, torch.Tensor):
                     scale2_tensor = scale2.to(dtype=torch.float32, device=weight.device)
                     factor = float(scale2_tensor.item()) if scale2_tensor.numel() == 1 else scale2_tensor
                     dequantized = dequantized * factor
+
+            if dequantized is not None:
                 checkpoint[key] = dequantized.to(target_dtype)
                 checkpoint.pop(scale_key, None)
-                removed_weight_scale += 1
+                report.removed_weight_scale += 1
                 if scale2_key in checkpoint:
                     checkpoint.pop(scale2_key, None)
-                    removed_weight_scale_2 += 1
-                dequantized_uint8_weights += 1
+                    report.removed_weight_scale_2 += 1
+                if not is_nvfp4:
+                    report.dequantized_uint8_weights += 1
 
     # Drop any remaining weight scale auxiliaries that were not consumed.
     for key in list(checkpoint.keys()):
         if key.endswith(".weight_scale"):
             checkpoint.pop(key)
-            removed_weight_scale += 1
+            report.removed_weight_scale += 1
         elif key.endswith(".weight_scale_2"):
             checkpoint.pop(key)
-            removed_weight_scale_2 += 1
+            report.removed_weight_scale_2 += 1
 
     # Safety net for any remaining fp8 tensors without explicit scales.
     for key, value in list(checkpoint.items()):
@@ -209,36 +292,109 @@ def _normalize_checkpoint_for_diffusers(
         if value.dtype not in fp8_types:
             continue
         checkpoint[key] = value.to(target_dtype)
-        cast_fp8_without_scale += 1
+        report.cast_unscaled_fp8_tensors += 1
 
     if any(
         (
-            removed_comfy,
-            removed_input_scale,
-            removed_weight_scale,
-            removed_weight_scale_2,
-            dequantized_weights,
-            dequantized_uint8_weights,
-            cast_fp8_without_scale,
+            report.removed_comfy,
+            report.removed_input_scale,
+            report.removed_weight_scale,
+            report.removed_weight_scale_2,
+            report.dequantized_fp8_weights,
+            report.dequantized_nvfp4_weights,
+            report.dequantized_uint8_weights,
+            report.cast_unscaled_fp8_tensors,
         )
     ):
         print(
             "Applied checkpoint normalization: "
-            f"removed {removed_comfy} `.comfy_quant`, "
-            f"{removed_input_scale} `.input_scale`, "
-            f"{removed_weight_scale} `.weight_scale`, "
-            f"{removed_weight_scale_2} `.weight_scale_2`; "
-            f"dequantized {dequantized_weights} fp8 weights, "
-            f"{dequantized_uint8_weights} uint8-grouped weights"
+            f"removed {report.removed_comfy} `.comfy_quant`, "
+            f"{report.removed_input_scale} `.input_scale`, "
+            f"{report.removed_weight_scale} `.weight_scale`, "
+            f"{report.removed_weight_scale_2} `.weight_scale_2`; "
+            f"dequantized {report.dequantized_fp8_weights} fp8 weights, "
+            f"{report.dequantized_nvfp4_weights} nvfp4 weights, "
+            f"{report.dequantized_uint8_weights} uint8-grouped weights"
             + (
-                f", cast {cast_fp8_without_scale} unscaled fp8 tensors"
-                if cast_fp8_without_scale
+                f", cast {report.cast_unscaled_fp8_tensors} unscaled fp8 tensors"
+                if report.cast_unscaled_fp8_tensors
                 else ""
             )
             + "."
         )
 
-    return checkpoint
+    return checkpoint, report
+
+
+def _tensor_stats(tensor: torch.Tensor) -> tuple[float, float, float, float]:
+    t = tensor.to(torch.float32)
+    return float(t.min()), float(t.max()), float(t.mean()), float(t.std())
+
+
+def _verify_nvfp4_decode(checkpoint: dict[str, object], report: NormalizationReport) -> None:
+    if report.dequantized_nvfp4_weights == 0:
+        print("NVFP4 verification: no NVFP4 weights decoded in this checkpoint.")
+        return
+
+    # Use non-NVFP4 dense weights as baseline for expected distribution scale.
+    baseline_stds: list[float] = []
+    for key, value in checkpoint.items():
+        if key in report.nvfp4_weight_keys:
+            continue
+        if not key.endswith(".weight"):
+            continue
+        if not isinstance(value, torch.Tensor):
+            continue
+        if value.ndim < 2:
+            continue
+        if not value.dtype.is_floating_point:
+            continue
+        _, _, _, std = _tensor_stats(value)
+        if std > 0:
+            baseline_stds.append(std)
+
+    baseline_std = median(baseline_stds) if baseline_stds else 0.02
+    print(
+        "NVFP4 verification baseline: "
+        f"median non-NVFP4 weight std={baseline_std:.6f} "
+        f"(sampled {len(baseline_stds)} layers)."
+    )
+
+    suspicious: list[str] = []
+    # Keep output concise but representative.
+    sample_keys = report.nvfp4_weight_keys[:12]
+    for key in sample_keys:
+        value = checkpoint.get(key)
+        if not isinstance(value, torch.Tensor):
+            suspicious.append(f"{key}: missing decoded tensor")
+            continue
+        t_min, t_max, mean, std = _tensor_stats(value)
+        mean_ratio = abs(mean) / (std + 1e-12)
+        std_ratio = std / (baseline_std + 1e-12)
+        print(
+            "NVFP4 verify "
+            f"{key}: min={t_min:.5f} max={t_max:.5f} mean={mean:.6f} std={std:.6f} "
+            f"(mean/std={mean_ratio:.4f}, std/baseline={std_ratio:.3f})"
+        )
+
+        if std <= 1e-6:
+            suspicious.append(f"{key}: near-zero std ({std:.6g})")
+        if mean_ratio > 0.08:
+            suspicious.append(f"{key}: strong mean bias ({mean_ratio:.4f})")
+        if std_ratio < 0.08 or std_ratio > 12.0:
+            suspicious.append(f"{key}: std ratio out of range ({std_ratio:.3f})")
+
+    if suspicious:
+        preview = "; ".join(suspicious[:6])
+        raise ValueError(
+            "NVFP4 verification failed; decoded weights look suspicious. "
+            f"Examples: {preview}"
+        )
+
+    print(
+        "NVFP4 verification passed: "
+        f"checked {len(sample_keys)} decoded layer(s), no suspicious statistics."
+    )
 
 
 def _resolve_local_config(model_size: str) -> str | None:
@@ -350,7 +506,9 @@ def main() -> int:
             "Retrying with checkpoint normalization..."
         )
         checkpoint = load_single_file_checkpoint(str(src))
-        checkpoint = _normalize_checkpoint_for_diffusers(checkpoint, target_dtype=dtype)
+        checkpoint, report = _normalize_checkpoint_for_diffusers(checkpoint, target_dtype=dtype)
+        if args.verify_nvfp4:
+            _verify_nvfp4_decode(checkpoint, report)
         model = Flux2Transformer2DModel.from_single_file(
             checkpoint,
             config=config,
