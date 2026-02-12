@@ -75,6 +75,13 @@ static double tf_get_time_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+/* Force f32 transformer weights (used for LoRA merge path). */
+static int g_tf_force_f32 = 0;
+
+void flux_transformer_set_force_f32(int enable) {
+    g_tf_force_f32 = enable ? 1 : 0;
+}
+
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -4809,7 +4816,7 @@ flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir) {
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
-    tf->use_bf16 = flux_metal_available();
+    tf->use_bf16 = flux_metal_available() && !g_tf_force_f32;
     if (tf->use_bf16) {
         if (flux_verbose)
             fprintf(stderr, "Using bf16 weights for GPU acceleration\n");
@@ -5061,7 +5068,7 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL
-    tf->use_bf16 = flux_metal_available();
+    tf->use_bf16 = flux_metal_available() && !g_tf_force_f32;
     if (tf->use_bf16) {
         if (flux_verbose)
             fprintf(stderr, "Using bf16 weights for GPU acceleration (mmap mode)\n");
@@ -5167,4 +5174,262 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
 #endif
 
     return tf;
+}
+
+/* ========================================================================
+ * LoRA Loading / Merge
+ * ======================================================================== */
+
+typedef struct {
+    int modules_applied;
+} lora_stats_t;
+
+static const safetensor_t *find_lora_tensor(const safetensors_file_t *sf,
+                                            const char *module,
+                                            const char *suffix,
+                                            char *resolved_name,
+                                            size_t resolved_cap) {
+    static const char *prefixes[] = {
+        "",
+        "base_model.model.",
+        "model.diffusion_model.",
+        "transformer.",
+        "base_model.model.transformer."
+    };
+    char key[512];
+    size_t i;
+
+    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        snprintf(key, sizeof(key), "%s%s.%s", prefixes[i], module, suffix);
+        const safetensor_t *t = safetensors_find(sf, key);
+        if (t) {
+            if (resolved_name && resolved_cap > 0) {
+                snprintf(resolved_name, resolved_cap, "%s", key);
+            }
+            return t;
+        }
+    }
+    return NULL;
+}
+
+static int lora_validate_matrix(const safetensor_t *t,
+                                int rows, int cols,
+                                const char *name) {
+    if (!t) return -1;
+    if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols) {
+        fprintf(stderr, "LoRA shape mismatch for %s: got [%lld, %lld], expected [%d, %d]\n",
+                name,
+                (long long)(t->ndim > 0 ? t->shape[0] : -1),
+                (long long)(t->ndim > 1 ? t->shape[1] : -1),
+                rows, cols);
+        return -1;
+    }
+    return 0;
+}
+
+/* Accumulate low-rank update into W:
+ *   W[out, in] += scale * (B[out, rank] @ A[rank, in]) */
+static void lora_accumulate(float *W,
+                            const float *B,
+                            const float *A,
+                            int out_dim,
+                            int in_dim,
+                            int rank,
+                            float scale) {
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                out_dim, in_dim, rank,
+                scale, B, rank, A, in_dim,
+                1.0f, W, in_dim);
+#else
+    int o, i, r;
+    for (o = 0; o < out_dim; o++) {
+        float *w_row = W + (size_t)o * in_dim;
+        const float *b_row = B + (size_t)o * rank;
+        for (r = 0; r < rank; r++) {
+            float alpha = scale * b_row[r];
+            const float *a_row = A + (size_t)r * in_dim;
+            for (i = 0; i < in_dim; i++) {
+                w_row[i] += alpha * a_row[i];
+            }
+        }
+    }
+#endif
+}
+
+static int apply_lora_matrix(const safetensors_file_t *sf,
+                             const char *module,
+                             float *W,
+                             int out_dim,
+                             int in_dim,
+                             float scale,
+                             lora_stats_t *stats) {
+    const safetensor_t *tA, *tB;
+    float *A = NULL, *B = NULL;
+    int rank;
+    char keyA[512], keyB[512];
+
+    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
+    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
+    if (!tA && !tB) return 0;  /* Module not present in this LoRA. */
+    if (!tA || !tB) {
+        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
+        return -1;
+    }
+
+    rank = (int)tA->shape[0];
+    if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
+    if (lora_validate_matrix(tB, out_dim, rank, keyB) != 0) return -1;
+
+    A = safetensors_get_f32(sf, tA);
+    B = safetensors_get_f32(sf, tB);
+    if (!A || !B) {
+        free(A);
+        free(B);
+        fprintf(stderr, "Failed to load LoRA tensors for module %s\n", module);
+        return -1;
+    }
+
+    lora_accumulate(W, B, A, out_dim, in_dim, rank, scale);
+    stats->modules_applied++;
+
+    free(A);
+    free(B);
+    return 0;
+}
+
+static int apply_lora_split_linear_in(const safetensors_file_t *sf,
+                                      const char *module,
+                                      float *gate_W,
+                                      float *up_W,
+                                      int mlp_hidden,
+                                      int in_dim,
+                                      float scale,
+                                      lora_stats_t *stats) {
+    const safetensor_t *tA, *tB;
+    float *A = NULL, *B = NULL;
+    int rank;
+    int out_total = mlp_hidden * 2;
+    char keyA[512], keyB[512];
+
+    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
+    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
+    if (!tA && !tB) return 0;
+    if (!tA || !tB) {
+        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
+        return -1;
+    }
+
+    rank = (int)tA->shape[0];
+    if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
+    if (lora_validate_matrix(tB, out_total, rank, keyB) != 0) return -1;
+
+    A = safetensors_get_f32(sf, tA);
+    B = safetensors_get_f32(sf, tB);
+    if (!A || !B) {
+        free(A);
+        free(B);
+        fprintf(stderr, "Failed to load LoRA tensors for module %s\n", module);
+        return -1;
+    }
+
+    lora_accumulate(gate_W, B, A, mlp_hidden, in_dim, rank, scale);
+    lora_accumulate(up_W, B + (size_t)mlp_hidden * rank, A, mlp_hidden, in_dim, rank, scale);
+    stats->modules_applied++;
+
+    free(A);
+    free(B);
+    return 0;
+}
+
+int flux_transformer_apply_lora(flux_transformer_t *tf,
+                                const char *lora_path, float scale) {
+    safetensors_file_t *sf;
+    lora_stats_t stats = {0};
+    int i;
+    int h, mlp, latent;
+    char module[256];
+
+    if (!tf || !lora_path || !lora_path[0] || scale <= 0.0f) return -1;
+
+    /* MVP contract: merge LoRA into f32 weights. */
+    if (tf->use_mmap || tf->use_bf16) {
+        fprintf(stderr, "LoRA merge requires non-mmap f32 transformer weights\n");
+        return -1;
+    }
+
+    sf = safetensors_open(lora_path);
+    if (!sf) {
+        fprintf(stderr, "Failed to open LoRA file: %s\n", lora_path);
+        return -1;
+    }
+
+    h = tf->hidden_size;
+    mlp = tf->mlp_hidden;
+    latent = tf->latent_channels;
+
+    if (apply_lora_matrix(sf, "x_embedder", tf->img_in_weight, h, latent, scale, &stats) != 0) goto error;
+    if (apply_lora_matrix(sf, "context_embedder", tf->txt_in_weight, h, tf->text_dim, scale, &stats) != 0) goto error;
+    if (apply_lora_matrix(sf, "double_stream_modulation_img.linear",
+                          tf->adaln_double_img_weight, h * 6, h, scale, &stats) != 0) goto error;
+    if (apply_lora_matrix(sf, "double_stream_modulation_txt.linear",
+                          tf->adaln_double_txt_weight, h * 6, h, scale, &stats) != 0) goto error;
+    if (apply_lora_matrix(sf, "single_stream_modulation.linear",
+                          tf->adaln_single_weight, h * 3, h, scale, &stats) != 0) goto error;
+    if (apply_lora_matrix(sf, "proj_out", tf->final_proj_weight, latent, h, scale, &stats) != 0) goto error;
+
+    for (i = 0; i < tf->num_double_layers; i++) {
+        double_block_t *b = &tf->double_blocks[i];
+
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_q", i);
+        if (apply_lora_matrix(sf, module, b->img_q_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_k", i);
+        if (apply_lora_matrix(sf, module, b->img_k_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_v", i);
+        if (apply_lora_matrix(sf, module, b->img_v_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_out.0", i);
+        if (apply_lora_matrix(sf, module, b->img_proj_weight, h, h, scale, &stats) != 0) goto error;
+
+        snprintf(module, sizeof(module), "transformer_blocks.%d.ff.linear_in", i);
+        if (apply_lora_split_linear_in(sf, module, b->img_mlp_gate_weight, b->img_mlp_up_weight,
+                                       mlp, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.ff.linear_out", i);
+        if (apply_lora_matrix(sf, module, b->img_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_q_proj", i);
+        if (apply_lora_matrix(sf, module, b->txt_q_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_k_proj", i);
+        if (apply_lora_matrix(sf, module, b->txt_k_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_v_proj", i);
+        if (apply_lora_matrix(sf, module, b->txt_v_weight, h, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_add_out", i);
+        if (apply_lora_matrix(sf, module, b->txt_proj_weight, h, h, scale, &stats) != 0) goto error;
+
+        snprintf(module, sizeof(module), "transformer_blocks.%d.ff_context.linear_in", i);
+        if (apply_lora_split_linear_in(sf, module, b->txt_mlp_gate_weight, b->txt_mlp_up_weight,
+                                       mlp, h, scale, &stats) != 0) goto error;
+        snprintf(module, sizeof(module), "transformer_blocks.%d.ff_context.linear_out", i);
+        if (apply_lora_matrix(sf, module, b->txt_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+    }
+
+    for (i = 0; i < tf->num_single_layers; i++) {
+        single_block_t *b = &tf->single_blocks[i];
+        snprintf(module, sizeof(module), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj", i);
+        if (apply_lora_matrix(sf, module, b->qkv_mlp_weight, h * 3 + mlp * 2, h, scale, &stats) != 0) goto error;
+    }
+
+    safetensors_close(sf);
+
+    if (stats.modules_applied == 0) {
+        fprintf(stderr, "LoRA applied to 0 modules (no matching keys found)\n");
+        return -1;
+    }
+    if (flux_verbose) {
+        fprintf(stderr, "LoRA applied: %d modules (scale=%.3f)\n", stats.modules_applied, scale);
+    }
+    return 0;
+
+error:
+    safetensors_close(sf);
+    return -1;
 }

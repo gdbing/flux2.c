@@ -45,6 +45,9 @@ extern float *flux_image_to_tensor(const flux_image *img);
 extern flux_transformer_t *flux_transformer_load(FILE *f);
 extern flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir);
 extern flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir);
+extern void flux_transformer_set_force_f32(int enable);
+extern int flux_transformer_apply_lora(flux_transformer_t *tf,
+                                       const char *lora_path, float scale);
 extern void flux_transformer_free(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
@@ -152,6 +155,11 @@ struct flux_ctx {
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
+
+    /* Optional transformer LoRA */
+    int use_lora;
+    float lora_scale;
+    char lora_path[1024];
 };
 
 /* Global error message */
@@ -311,6 +319,37 @@ void flux_set_mmap(flux_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
 }
 
+int flux_set_lora(flux_ctx *ctx, const char *lora_path, float scale) {
+    struct stat st;
+
+    if (!ctx) {
+        set_error("Invalid context");
+        return -1;
+    }
+    if (!lora_path || !lora_path[0]) {
+        set_error("LoRA path is empty");
+        return -1;
+    }
+    if (scale <= 0.0f) {
+        set_error("LoRA scale must be > 0");
+        return -1;
+    }
+    if (ctx->transformer) {
+        set_error("Set LoRA before first generation");
+        return -1;
+    }
+    if (stat(lora_path, &st) != 0) {
+        set_error("LoRA file not found");
+        return -1;
+    }
+
+    ctx->use_lora = 1;
+    ctx->lora_scale = scale;
+    strncpy(ctx->lora_path, lora_path, sizeof(ctx->lora_path) - 1);
+    ctx->lora_path[sizeof(ctx->lora_path) - 1] = '\0';
+    return 0;
+}
+
 int flux_is_distilled(flux_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
 }
@@ -340,20 +379,47 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 
 /* Load transformer on-demand if not already loaded */
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
+    int use_mmap;
+
     if (ctx->transformer) return 1;  /* Already loaded */
 
+    use_mmap = ctx->use_mmap;
+    if (ctx->use_lora && use_mmap) {
+        if (flux_verbose) {
+            fprintf(stderr, "LoRA enabled: disabling mmap for transformer load\n");
+        }
+        use_mmap = 0;
+    }
+
+    /* LoRA merge currently requires f32 transformer weights. */
+    flux_transformer_set_force_f32(ctx->use_lora ? 1 : 0);
+
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
-    if (ctx->use_mmap) {
+    if (use_mmap) {
         ctx->transformer = flux_transformer_load_safetensors_mmap(ctx->model_dir);
     } else {
         ctx->transformer = flux_transformer_load_safetensors(ctx->model_dir);
     }
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
+    flux_transformer_set_force_f32(0);
 
     if (!ctx->transformer) {
         set_error("Failed to load transformer");
         return 0;
     }
+
+    if (ctx->use_lora) {
+        if (flux_phase_callback) flux_phase_callback("Applying LoRA", 0);
+        if (flux_transformer_apply_lora(ctx->transformer, ctx->lora_path, ctx->lora_scale) != 0) {
+            if (flux_phase_callback) flux_phase_callback("Applying LoRA", 1);
+            flux_transformer_free(ctx->transformer);
+            ctx->transformer = NULL;
+            set_error("Failed to apply LoRA");
+            return 0;
+        }
+        if (flux_phase_callback) flux_phase_callback("Applying LoRA", 1);
+    }
+
     return 1;
 }
 

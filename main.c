@@ -233,6 +233,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n\n");
     fprintf(stderr, "Model options:\n");
     fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
+    fprintf(stderr, "      --lora PATH       Apply transformer LoRA adapter (.safetensors)\n");
+    fprintf(stderr, "      --lora-scale N    LoRA scale multiplier (default: 1.0)\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
     fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
     fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
@@ -264,6 +266,15 @@ int main(int argc, char *argv[]) {
     flux_metal_init();
 #endif
 
+    enum {
+        OPT_POWER = 256,
+        OPT_POWER_ALPHA = 257,
+        OPT_NO_LICENSE_INFO = 258,
+        OPT_BLAS_THREADS = 259,
+        OPT_LORA = 260,
+        OPT_LORA_SCALE = 261
+    };
+
     /* Command line options */
     static struct option long_options[] = {
         {"dir",        required_argument, 0, 'd'},
@@ -287,12 +298,14 @@ int main(int argc, char *argv[]) {
         {"show-steps", no_argument,       0, 'K'},
         {"zoom",       required_argument, 0, 'z'},
         {"base",       no_argument,       0, 'B'},
+        {"lora",       required_argument, 0, OPT_LORA},
+        {"lora-scale", required_argument, 0, OPT_LORA_SCALE},
         {"linear",     no_argument,       0, 'L'},
-        {"power",      no_argument,       0, 256},
-        {"power-alpha",required_argument, 0, 257},
+        {"power",      no_argument,       0, OPT_POWER},
+        {"power-alpha",required_argument, 0, OPT_POWER_ALPHA},
         {"debug-py",   no_argument,       0, 'D'},
-        {"no-license-info", no_argument, 0, 258},
-        {"blas-threads",required_argument, 0, 259},
+        {"no-license-info", no_argument, 0, OPT_NO_LICENSE_INFO},
+        {"blas-threads",required_argument, 0, OPT_BLAS_THREADS},
         {0, 0, 0, 0}
     };
 
@@ -304,6 +317,8 @@ int main(int argc, char *argv[]) {
     int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
+    char *lora_path = NULL;
+    float lora_scale = 1.0f;
 
     flux_params params = {
         .width = DEFAULT_WIDTH,
@@ -357,12 +372,14 @@ int main(int argc, char *argv[]) {
             case 'K': show_steps = 1; break;
             case 'z': terminal_set_zoom(atoi(optarg)); break;
             case 'B': force_base = 1; break;
+            case OPT_LORA: lora_path = optarg; break;
+            case OPT_LORA_SCALE: lora_scale = atof(optarg); break;
             case 'L': params.linear_schedule = 1; break;
-            case 256: params.power_schedule = 1; break;
-            case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
-            case 258: no_license_info = 1; break;
+            case OPT_POWER: params.power_schedule = 1; break;
+            case OPT_POWER_ALPHA: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
+            case OPT_NO_LICENSE_INFO: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
-            case 259: blas_threads = atoi(optarg); break;
+            case OPT_BLAS_THREADS: blas_threads = atoi(optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -443,6 +460,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
         return 1;
     }
+    if (lora_path && lora_scale <= 0.0f) {
+        fprintf(stderr, "Error: --lora-scale must be > 0\n");
+        return 1;
+    }
 
     /* Set seed */
     int64_t actual_seed;
@@ -460,6 +481,7 @@ int main(int argc, char *argv[]) {
     LOG_VERBOSE("Model: %s\n", model_dir);
     if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
     LOG_VERBOSE("Output: %s\n", output_path);
+    if (lora_path) LOG_VERBOSE("LoRA: %s (scale=%.3f)\n", lora_path, lora_scale);
     LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
     LOG_VERBOSE("Steps: %d\n", params.num_steps);
     if (num_inputs > 0) {
@@ -485,6 +507,14 @@ int main(int argc, char *argv[]) {
     if (use_mmap) {
         flux_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
+    }
+
+    if (lora_path) {
+        if (flux_set_lora(ctx, lora_path, lora_scale) != 0) {
+            fprintf(stderr, "Error: Failed to set LoRA: %s\n", flux_get_error());
+            flux_free(ctx);
+            return 1;
+        }
     }
 
     /* Override model type if --base was specified */

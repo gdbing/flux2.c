@@ -121,6 +121,17 @@ void flux_release_text_encoder(flux_ctx *ctx);
 void flux_set_mmap(flux_ctx *ctx, int enable);
 
 /*
+ * Configure a transformer LoRA adapter to apply at transformer load time.
+ * Must be called after flux_load_dir() and before first generation.
+ * Returns 0 on success, -1 on error.
+ *
+ * Notes:
+ * - This MVP supports standard LoRA (A/B matrices) on transformer weights.
+ * - mmap is automatically disabled while LoRA is active.
+ */
+int flux_set_lora(flux_ctx *ctx, const char *lora_path, float scale);
+
+/*
  * Check if model is distilled (4-step) or base (50-step with CFG).
  * Returns 1 for distilled, 0 for base.
  */

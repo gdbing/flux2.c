@@ -26,3 +26,9 @@ documents/
 *.a
 *.so
 *.dylib
+flux_shaders_source.h
+conversion/__pycache__/
+
+# LoRA local workspace artifacts
+lora/*
+!lora/run_local_flux2_lora.py
