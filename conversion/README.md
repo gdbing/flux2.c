@@ -27,16 +27,24 @@ uv run python convert_flux2_transformer.py \
 
 Optional flags:
 
-- `--config` (default: `black-forest-labs/FLUX.2-klein-4B`)
+- `--config` (default: `auto`)
 - `--subfolder` (default: `transformer`)
 - `--dtype` (`float32`, `float16`, `bfloat16`; default: `bfloat16`)
+
+`--config auto` inspects checkpoint tensor shapes and picks 4B vs 9B automatically
+(preferring local `flux-klein-model` / `flux-klein-9b` folders when available).
 
 ## Check `flux2.c` key compatibility
 
 ```bash
 uv run python check_flux2c_keys.py \
-  /absolute/path/to/converted/transformer/diffusion_pytorch_model.safetensors
+  /absolute/path/to/converted/transformer
 ```
+
+You can pass any of:
+- `.../transformer/diffusion_pytorch_model.safetensors` (single file)
+- `.../transformer/diffusion_pytorch_model.safetensors.index.json` (sharded)
+- `.../transformer` directory (auto-detects either)
 
 Exit codes:
 
@@ -47,5 +55,7 @@ Exit codes:
 
 - This uses `diffusers` from GitHub (`main`) to ensure `Flux2Transformer2DModel`
   is available.
+- Large outputs (for example 9B) may be saved as sharded safetensors with
+  `diffusion_pytorch_model.safetensors.index.json` plus multiple shard files.
 - If conversion succeeds but key check still fails, the checkpoint likely uses a
   variant schema that still needs a post-conversion remap.

@@ -6,10 +6,15 @@ Convert a FLUX-style single-file checkpoint into a Diffusers transformer folder.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import torch
+try:
+    from safetensors import safe_open
+except ImportError:  # pragma: no cover - provided by conversion env
+    safe_open = None
 
 try:
     from diffusers import Flux2Transformer2DModel
@@ -21,6 +26,9 @@ except ImportError as exc:
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
+
+DEFAULT_CONFIG_4B = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_CONFIG_9B = "black-forest-labs/FLUX.2-klein-9B"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +42,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output transformer directory")
     p.add_argument(
         "--config",
-        default="black-forest-labs/FLUX.2-klein-4B",
-        help="Model config repo or path (default: %(default)s)",
+        default="auto",
+        help=(
+            "Model config repo/path, or `auto` to detect 4B vs 9B from checkpoint "
+            "tensor shapes (default: %(default)s)"
+        ),
     )
     p.add_argument(
         "--subfolder",
@@ -71,6 +82,86 @@ def _strip_prefix_if_present(checkpoint: dict[str, object], prefix: str) -> dict
     return remapped
 
 
+def _resolve_local_config(model_size: str) -> str | None:
+    repo_root = Path(__file__).resolve().parent.parent
+    local_map = {
+        "4B": repo_root / "flux-klein-model",
+        "9B": repo_root / "flux-klein-9b",
+    }
+    local = local_map.get(model_size)
+    if local is None:
+        return None
+    if (local / "transformer" / "config.json").exists():
+        return str(local)
+    return None
+
+
+def _detect_model_size_from_checkpoint(src: Path) -> str | None:
+    if safe_open is None:
+        return None
+
+    key_candidates = (
+        "double_stream_modulation_img.lin.weight",
+        "double_stream_modulation_img.linear.weight",
+        "img_in.weight",
+        "txt_in.weight",
+    )
+    prefixes = ("", "model.", "model.diffusion_model.")
+
+    try:
+        with safe_open(str(src), framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for suffix in key_candidates:
+                for prefix in prefixes:
+                    key = f"{prefix}{suffix}"
+                    if key not in keys:
+                        continue
+                    shape = tuple(f.get_slice(key).get_shape())
+                    if len(shape) < 2:
+                        continue
+                    hidden_size = int(shape[1])
+                    if hidden_size == 3072:
+                        return "4B"
+                    if hidden_size == 4096:
+                        return "9B"
+    except Exception as exc:
+        print(
+            f"Warning: could not inspect checkpoint for auto config detection ({exc}); "
+            "falling back to 4B config."
+        )
+    return None
+
+
+def resolve_config(config_arg: str, src: Path) -> str:
+    if config_arg != "auto":
+        return config_arg
+
+    model_size = _detect_model_size_from_checkpoint(src)
+    if model_size == "9B":
+        config = _resolve_local_config("9B") or DEFAULT_CONFIG_9B
+        print(f"Auto-detected model size: 9B (hidden size 4096). Using config: {config}")
+        return config
+    if model_size == "4B":
+        config = _resolve_local_config("4B") or DEFAULT_CONFIG_4B
+        print(f"Auto-detected model size: 4B (hidden size 3072). Using config: {config}")
+        return config
+
+    fallback = _resolve_local_config("4B") or DEFAULT_CONFIG_4B
+    print(f"Auto-detection failed; falling back to config: {fallback}")
+    return fallback
+
+
+def _count_shards(index_file: Path) -> int | None:
+    try:
+        data = json.loads(index_file.read_text())
+        weight_map = data.get("weight_map", {})
+        if not isinstance(weight_map, dict):
+            return None
+        return len(set(weight_map.values()))
+    except Exception:
+        return None
+
+
 def main() -> int:
     args = parse_args()
     src = Path(args.src).expanduser().resolve()
@@ -82,13 +173,14 @@ def main() -> int:
 
     out.mkdir(parents=True, exist_ok=True)
     dtype = dtype_from_name(args.dtype)
+    config = resolve_config(args.config, src)
 
     print(f"Loading single-file checkpoint: {src}")
-    print(f"Using config: {args.config} (subfolder={args.subfolder})")
+    print(f"Using config: {config} (subfolder={args.subfolder})")
     try:
         model = Flux2Transformer2DModel.from_single_file(
             str(src),
-            config=args.config,
+            config=config,
             subfolder=args.subfolder,
             torch_dtype=dtype,
         )
@@ -105,7 +197,7 @@ def main() -> int:
         checkpoint = _strip_prefix_if_present(checkpoint, "model.diffusion_model.")
         model = Flux2Transformer2DModel.from_single_file(
             checkpoint,
-            config=args.config,
+            config=config,
             subfolder=args.subfolder,
             torch_dtype=dtype,
         )
@@ -114,12 +206,19 @@ def main() -> int:
     model.save_pretrained(str(out), safe_serialization=True)
 
     out_file = out / "diffusion_pytorch_model.safetensors"
+    index_file = out / "diffusion_pytorch_model.safetensors.index.json"
     if out_file.exists():
         print(f"Done: {out_file}")
+    elif index_file.exists():
+        shard_count = _count_shards(index_file)
+        if shard_count is None:
+            print(f"Done: {index_file} (sharded output)")
+        else:
+            print(f"Done: {index_file} (sharded output, {shard_count} files)")
     else:
         print(
-            "Warning: conversion finished but output safetensors file was not found "
-            f"at {out_file}",
+            "Warning: conversion finished but neither a single safetensors file nor shard index "
+            f"was found in {out}",
             file=sys.stderr,
         )
     return 0

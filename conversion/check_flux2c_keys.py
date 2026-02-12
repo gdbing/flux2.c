@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "path",
         help=(
-            "Path to a transformer safetensors file, usually "
-            "transformer/diffusion_pytorch_model.safetensors"
+            "Path to a transformer safetensors file, a sharded safetensors "
+            "index JSON, or a transformer directory containing either."
         ),
     )
     p.add_argument(
@@ -62,11 +62,43 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_keys(path: Path) -> list[str]:
+def load_keys_from_safetensors(path: Path) -> list[str]:
     with path.open("rb") as f:
         header_size = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(header_size))
     return sorted(k for k in header.keys() if k != "__metadata__")
+
+
+def load_keys_from_index(path: Path) -> list[str]:
+    data = json.loads(path.read_text())
+    weight_map = data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Invalid shard index file (missing dict weight_map): {path}")
+    return sorted(weight_map.keys())
+
+
+def resolve_input_path(path: Path) -> tuple[Path, str]:
+    if path.is_dir():
+        single_file = path / "diffusion_pytorch_model.safetensors"
+        index_file = path / "diffusion_pytorch_model.safetensors.index.json"
+        if single_file.exists():
+            return single_file, "safetensors"
+        if index_file.exists():
+            return index_file, "index"
+        raise FileNotFoundError(
+            "Directory does not contain diffusion_pytorch_model.safetensors "
+            "or diffusion_pytorch_model.safetensors.index.json"
+        )
+
+    if path.name.endswith(".safetensors.index.json"):
+        return path, "index"
+    if path.suffix == ".safetensors":
+        return path, "safetensors"
+
+    raise ValueError(
+        "Unsupported input path. Use a .safetensors file, a "
+        ".safetensors.index.json file, or a transformer directory."
+    )
 
 
 def main() -> int:
@@ -76,10 +108,20 @@ def main() -> int:
         print(f"Error: file not found: {path}")
         return 1
 
-    keys = load_keys(path)
+    try:
+        resolved_path, input_kind = resolve_input_path(path)
+        if input_kind == "index":
+            keys = load_keys_from_index(resolved_path)
+        else:
+            keys = load_keys_from_safetensors(resolved_path)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}")
+        return 1
+
     key_set = set(keys)
 
-    print(f"File: {path}")
+    print(f"Input: {resolved_path}")
+    print(f"Input type: {input_kind}")
     print(f"Tensor count: {len(keys)}")
     print("")
 
