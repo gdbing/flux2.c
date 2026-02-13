@@ -5548,6 +5548,160 @@ static int apply_lora_split_qkv(const safetensors_file_t *sf,
     return 0;
 }
 
+static inline uint16_t f32_to_bf16_rne(float x) {
+    uint32_t bits;
+    uint32_t lsb;
+    uint32_t rounding_bias;
+    memcpy(&bits, &x, sizeof(bits));
+    lsb = (bits >> 16) & 1U;
+    rounding_bias = 0x7FFFU + lsb;
+    bits += rounding_bias;
+    return (uint16_t)(bits >> 16);
+}
+
+static int convert_f32_array_to_bf16(uint16_t **dst,
+                                     const float *src,
+                                     size_t count,
+                                     const char *name) {
+    uint16_t *out;
+    size_t i;
+
+    if (!dst || !src || count == 0) {
+        fprintf(stderr, "LoRA bf16 conversion skipped/invalid for %s\n",
+                name ? name : "(unknown)");
+        return -1;
+    }
+
+    out = (uint16_t *)malloc(count * sizeof(uint16_t));
+    if (!out) {
+        fprintf(stderr, "LoRA bf16 conversion OOM for %s (%zu elems)\n",
+                name ? name : "(unknown)", count);
+        return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        out[i] = f32_to_bf16_rne(src[i]);
+    }
+
+    free(*dst);
+    *dst = out;
+    return 0;
+}
+
+static void clear_non_mmap_bf16_weights(flux_transformer_t *tf) {
+    if (!tf || tf->use_mmap) return;
+
+    free(tf->img_in_weight_bf16); tf->img_in_weight_bf16 = NULL;
+    free(tf->txt_in_weight_bf16); tf->txt_in_weight_bf16 = NULL;
+    free(tf->final_proj_weight_bf16); tf->final_proj_weight_bf16 = NULL;
+
+    if (tf->double_blocks) {
+        for (int i = 0; i < tf->num_double_layers; i++) {
+            double_block_t *b = &tf->double_blocks[i];
+            free(b->img_q_weight_bf16); b->img_q_weight_bf16 = NULL;
+            free(b->img_k_weight_bf16); b->img_k_weight_bf16 = NULL;
+            free(b->img_v_weight_bf16); b->img_v_weight_bf16 = NULL;
+            free(b->img_proj_weight_bf16); b->img_proj_weight_bf16 = NULL;
+            free(b->img_mlp_gate_weight_bf16); b->img_mlp_gate_weight_bf16 = NULL;
+            free(b->img_mlp_up_weight_bf16); b->img_mlp_up_weight_bf16 = NULL;
+            free(b->img_mlp_down_weight_bf16); b->img_mlp_down_weight_bf16 = NULL;
+
+            free(b->txt_q_weight_bf16); b->txt_q_weight_bf16 = NULL;
+            free(b->txt_k_weight_bf16); b->txt_k_weight_bf16 = NULL;
+            free(b->txt_v_weight_bf16); b->txt_v_weight_bf16 = NULL;
+            free(b->txt_proj_weight_bf16); b->txt_proj_weight_bf16 = NULL;
+            free(b->txt_mlp_gate_weight_bf16); b->txt_mlp_gate_weight_bf16 = NULL;
+            free(b->txt_mlp_up_weight_bf16); b->txt_mlp_up_weight_bf16 = NULL;
+            free(b->txt_mlp_down_weight_bf16); b->txt_mlp_down_weight_bf16 = NULL;
+        }
+    }
+
+    if (tf->single_blocks) {
+        for (int i = 0; i < tf->num_single_layers; i++) {
+            single_block_t *b = &tf->single_blocks[i];
+            free(b->qkv_mlp_weight_bf16); b->qkv_mlp_weight_bf16 = NULL;
+            free(b->proj_mlp_weight_bf16); b->proj_mlp_weight_bf16 = NULL;
+        }
+    }
+}
+
+static int convert_merged_weights_to_bf16(flux_transformer_t *tf) {
+#ifdef USE_METAL
+    int h, mlp, latent, fused_dim;
+
+    if (!tf || tf->use_mmap) return -1;
+    if (!flux_metal_available()) return 0;  /* Keep f32 on non-Metal runtime. */
+
+    clear_non_mmap_bf16_weights(tf);
+
+    h = tf->hidden_size;
+    mlp = tf->mlp_hidden;
+    latent = tf->latent_channels;
+    fused_dim = h * 3 + mlp * 2;
+
+    if (convert_f32_array_to_bf16(&tf->img_in_weight_bf16, tf->img_in_weight,
+                                  (size_t)h * latent, "x_embedder.weight") != 0) goto fail;
+    if (convert_f32_array_to_bf16(&tf->txt_in_weight_bf16, tf->txt_in_weight,
+                                  (size_t)h * tf->text_dim, "context_embedder.weight") != 0) goto fail;
+    if (convert_f32_array_to_bf16(&tf->final_proj_weight_bf16, tf->final_proj_weight,
+                                  (size_t)latent * h, "proj_out.weight") != 0) goto fail;
+
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        double_block_t *b = &tf->double_blocks[i];
+
+        if (convert_f32_array_to_bf16(&b->img_q_weight_bf16, b->img_q_weight,
+                                      (size_t)h * h, "double.img_q") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_k_weight_bf16, b->img_k_weight,
+                                      (size_t)h * h, "double.img_k") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_v_weight_bf16, b->img_v_weight,
+                                      (size_t)h * h, "double.img_v") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_proj_weight_bf16, b->img_proj_weight,
+                                      (size_t)h * h, "double.img_proj") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_mlp_gate_weight_bf16, b->img_mlp_gate_weight,
+                                      (size_t)mlp * h, "double.img_mlp_gate") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_mlp_up_weight_bf16, b->img_mlp_up_weight,
+                                      (size_t)mlp * h, "double.img_mlp_up") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->img_mlp_down_weight_bf16, b->img_mlp_down_weight,
+                                      (size_t)h * mlp, "double.img_mlp_down") != 0) goto fail;
+
+        if (convert_f32_array_to_bf16(&b->txt_q_weight_bf16, b->txt_q_weight,
+                                      (size_t)h * h, "double.txt_q") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_k_weight_bf16, b->txt_k_weight,
+                                      (size_t)h * h, "double.txt_k") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_v_weight_bf16, b->txt_v_weight,
+                                      (size_t)h * h, "double.txt_v") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_proj_weight_bf16, b->txt_proj_weight,
+                                      (size_t)h * h, "double.txt_proj") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_mlp_gate_weight_bf16, b->txt_mlp_gate_weight,
+                                      (size_t)mlp * h, "double.txt_mlp_gate") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_mlp_up_weight_bf16, b->txt_mlp_up_weight,
+                                      (size_t)mlp * h, "double.txt_mlp_up") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->txt_mlp_down_weight_bf16, b->txt_mlp_down_weight,
+                                      (size_t)h * mlp, "double.txt_mlp_down") != 0) goto fail;
+    }
+
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        single_block_t *b = &tf->single_blocks[i];
+        if (convert_f32_array_to_bf16(&b->qkv_mlp_weight_bf16, b->qkv_mlp_weight,
+                                      (size_t)fused_dim * h, "single.qkv_mlp") != 0) goto fail;
+        if (convert_f32_array_to_bf16(&b->proj_mlp_weight_bf16, b->proj_mlp_weight,
+                                      (size_t)h * (h + mlp), "single.proj_mlp") != 0) goto fail;
+    }
+
+    tf->use_bf16 = 1;
+    warmup_bf16_weights(tf);
+    return 0;
+
+fail:
+    clear_non_mmap_bf16_weights(tf);
+    tf->use_bf16 = 0;
+    return -1;
+#else
+    (void)tf;
+    return 0;
+#endif
+}
+
 int flux_transformer_apply_lora(flux_transformer_t *tf,
                                 const char *lora_path, float scale) {
     safetensors_file_t *sf;
@@ -5708,6 +5862,15 @@ int flux_transformer_apply_lora(flux_transformer_t *tf,
     if (flux_verbose) {
         fprintf(stderr, "LoRA applied: %d modules (scale=%.3f)\n", stats.modules_applied, scale);
     }
+
+    if (convert_merged_weights_to_bf16(tf) == 0) {
+        if (flux_verbose && tf->use_bf16) {
+            fprintf(stderr, "LoRA runtime: converted merged transformer weights to bf16\n");
+        }
+    } else if (flux_verbose) {
+        fprintf(stderr, "LoRA runtime: bf16 conversion failed, continuing with f32 weights\n");
+    }
+
     return 0;
 
 error:
