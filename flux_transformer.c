@@ -5191,7 +5191,9 @@ static const safetensor_t *find_lora_tensor(const safetensors_file_t *sf,
                                             size_t resolved_cap) {
     static const char *prefixes[] = {
         "",
+        "diffusion_model.",
         "base_model.model.",
+        "base_model.model.diffusion_model.",
         "model.diffusion_model.",
         "transformer.",
         "base_model.model.transformer."
@@ -5342,6 +5344,52 @@ static int apply_lora_split_linear_in(const safetensors_file_t *sf,
     return 0;
 }
 
+static int apply_lora_split_qkv(const safetensors_file_t *sf,
+                                const char *module,
+                                float *q_W,
+                                float *k_W,
+                                float *v_W,
+                                int hidden,
+                                int in_dim,
+                                float scale,
+                                lora_stats_t *stats) {
+    const safetensor_t *tA, *tB;
+    float *A = NULL, *B = NULL;
+    int rank;
+    int out_total = hidden * 3;
+    char keyA[512], keyB[512];
+
+    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
+    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
+    if (!tA && !tB) return 0;
+    if (!tA || !tB) {
+        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
+        return -1;
+    }
+
+    rank = (int)tA->shape[0];
+    if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
+    if (lora_validate_matrix(tB, out_total, rank, keyB) != 0) return -1;
+
+    A = safetensors_get_f32(sf, tA);
+    B = safetensors_get_f32(sf, tB);
+    if (!A || !B) {
+        free(A);
+        free(B);
+        fprintf(stderr, "Failed to load LoRA tensors for module %s\n", module);
+        return -1;
+    }
+
+    lora_accumulate(q_W, B, A, hidden, in_dim, rank, scale);
+    lora_accumulate(k_W, B + (size_t)hidden * rank, A, hidden, in_dim, rank, scale);
+    lora_accumulate(v_W, B + (size_t)hidden * rank * 2, A, hidden, in_dim, rank, scale);
+    stats->modules_applied++;
+
+    free(A);
+    free(B);
+    return 0;
+}
+
 int flux_transformer_apply_lora(flux_transformer_t *tf,
                                 const char *lora_path, float scale) {
     safetensors_file_t *sf;
@@ -5380,42 +5428,117 @@ int flux_transformer_apply_lora(flux_transformer_t *tf,
 
     for (i = 0; i < tf->num_double_layers; i++) {
         double_block_t *b = &tf->double_blocks[i];
+        int applied_before;
+        int q_applied, k_applied, v_applied;
 
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_q", i);
         if (apply_lora_matrix(sf, module, b->img_q_weight, h, h, scale, &stats) != 0) goto error;
+        q_applied = (stats.modules_applied != applied_before);
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_k", i);
         if (apply_lora_matrix(sf, module, b->img_k_weight, h, h, scale, &stats) != 0) goto error;
+        k_applied = (stats.modules_applied != applied_before);
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_v", i);
         if (apply_lora_matrix(sf, module, b->img_v_weight, h, h, scale, &stats) != 0) goto error;
+        v_applied = (stats.modules_applied != applied_before);
+        if (!q_applied && !k_applied && !v_applied) {
+            snprintf(module, sizeof(module), "double_blocks.%d.img_attn.qkv", i);
+            if (apply_lora_split_qkv(sf, module, b->img_q_weight, b->img_k_weight, b->img_v_weight,
+                                     h, h, scale, &stats) != 0) goto error;
+        }
+
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_out.0", i);
         if (apply_lora_matrix(sf, module, b->img_proj_weight, h, h, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.img_attn.proj", i);
+            if (apply_lora_matrix(sf, module, b->img_proj_weight, h, h, scale, &stats) != 0) goto error;
+        }
 
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.ff.linear_in", i);
         if (apply_lora_split_linear_in(sf, module, b->img_mlp_gate_weight, b->img_mlp_up_weight,
                                        mlp, h, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.img_mlp.0", i);
+            if (apply_lora_split_linear_in(sf, module, b->img_mlp_gate_weight, b->img_mlp_up_weight,
+                                           mlp, h, scale, &stats) != 0) goto error;
+        }
+
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.ff.linear_out", i);
         if (apply_lora_matrix(sf, module, b->img_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.img_mlp.2", i);
+            if (apply_lora_matrix(sf, module, b->img_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+        }
 
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_q_proj", i);
         if (apply_lora_matrix(sf, module, b->txt_q_weight, h, h, scale, &stats) != 0) goto error;
+        q_applied = (stats.modules_applied != applied_before);
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_k_proj", i);
         if (apply_lora_matrix(sf, module, b->txt_k_weight, h, h, scale, &stats) != 0) goto error;
+        k_applied = (stats.modules_applied != applied_before);
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.add_v_proj", i);
         if (apply_lora_matrix(sf, module, b->txt_v_weight, h, h, scale, &stats) != 0) goto error;
+        v_applied = (stats.modules_applied != applied_before);
+        if (!q_applied && !k_applied && !v_applied) {
+            snprintf(module, sizeof(module), "double_blocks.%d.txt_attn.qkv", i);
+            if (apply_lora_split_qkv(sf, module, b->txt_q_weight, b->txt_k_weight, b->txt_v_weight,
+                                     h, h, scale, &stats) != 0) goto error;
+        }
+
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.attn.to_add_out", i);
         if (apply_lora_matrix(sf, module, b->txt_proj_weight, h, h, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.txt_attn.proj", i);
+            if (apply_lora_matrix(sf, module, b->txt_proj_weight, h, h, scale, &stats) != 0) goto error;
+        }
 
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.ff_context.linear_in", i);
         if (apply_lora_split_linear_in(sf, module, b->txt_mlp_gate_weight, b->txt_mlp_up_weight,
                                        mlp, h, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.txt_mlp.0", i);
+            if (apply_lora_split_linear_in(sf, module, b->txt_mlp_gate_weight, b->txt_mlp_up_weight,
+                                           mlp, h, scale, &stats) != 0) goto error;
+        }
+
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "transformer_blocks.%d.ff_context.linear_out", i);
         if (apply_lora_matrix(sf, module, b->txt_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "double_blocks.%d.txt_mlp.2", i);
+            if (apply_lora_matrix(sf, module, b->txt_mlp_down_weight, h, mlp, scale, &stats) != 0) goto error;
+        }
     }
 
     for (i = 0; i < tf->num_single_layers; i++) {
         single_block_t *b = &tf->single_blocks[i];
+        int applied_before;
+
+        applied_before = stats.modules_applied;
         snprintf(module, sizeof(module), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj", i);
         if (apply_lora_matrix(sf, module, b->qkv_mlp_weight, h * 3 + mlp * 2, h, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "single_blocks.%d.linear1", i);
+            if (apply_lora_matrix(sf, module, b->qkv_mlp_weight, h * 3 + mlp * 2, h, scale, &stats) != 0) goto error;
+        }
+
+        applied_before = stats.modules_applied;
+        snprintf(module, sizeof(module), "single_transformer_blocks.%d.attn.to_out", i);
+        if (apply_lora_matrix(sf, module, b->proj_mlp_weight, h, h + mlp, scale, &stats) != 0) goto error;
+        if (stats.modules_applied == applied_before) {
+            snprintf(module, sizeof(module), "single_blocks.%d.linear2", i);
+            if (apply_lora_matrix(sf, module, b->proj_mlp_weight, h, h + mlp, scale, &stats) != 0) goto error;
+        }
     }
 
     safetensors_close(sf);
