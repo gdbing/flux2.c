@@ -5625,12 +5625,53 @@ static void clear_non_mmap_bf16_weights(flux_transformer_t *tf) {
     }
 }
 
+/* After a successful f32->bf16 conversion, we can drop large f32 runtime weights.
+ * Keep small/control tensors in f32 (norms, modulation, timestep/final norm), since
+ * those are still consumed on CPU paths. */
+static void free_f32_runtime_weights_after_bf16(flux_transformer_t *tf) {
+    if (!tf || tf->use_mmap) return;
+
+    free(tf->img_in_weight); tf->img_in_weight = NULL;
+    free(tf->txt_in_weight); tf->txt_in_weight = NULL;
+    free(tf->final_proj_weight); tf->final_proj_weight = NULL;
+
+    if (tf->double_blocks) {
+        for (int i = 0; i < tf->num_double_layers; i++) {
+            double_block_t *b = &tf->double_blocks[i];
+            free(b->img_q_weight); b->img_q_weight = NULL;
+            free(b->img_k_weight); b->img_k_weight = NULL;
+            free(b->img_v_weight); b->img_v_weight = NULL;
+            free(b->img_proj_weight); b->img_proj_weight = NULL;
+            free(b->img_mlp_gate_weight); b->img_mlp_gate_weight = NULL;
+            free(b->img_mlp_up_weight); b->img_mlp_up_weight = NULL;
+            free(b->img_mlp_down_weight); b->img_mlp_down_weight = NULL;
+
+            free(b->txt_q_weight); b->txt_q_weight = NULL;
+            free(b->txt_k_weight); b->txt_k_weight = NULL;
+            free(b->txt_v_weight); b->txt_v_weight = NULL;
+            free(b->txt_proj_weight); b->txt_proj_weight = NULL;
+            free(b->txt_mlp_gate_weight); b->txt_mlp_gate_weight = NULL;
+            free(b->txt_mlp_up_weight); b->txt_mlp_up_weight = NULL;
+            free(b->txt_mlp_down_weight); b->txt_mlp_down_weight = NULL;
+        }
+    }
+
+    if (tf->single_blocks) {
+        for (int i = 0; i < tf->num_single_layers; i++) {
+            single_block_t *b = &tf->single_blocks[i];
+            free(b->qkv_mlp_weight); b->qkv_mlp_weight = NULL;
+            free(b->proj_mlp_weight); b->proj_mlp_weight = NULL;
+        }
+    }
+}
+
 static int convert_merged_weights_to_bf16(flux_transformer_t *tf) {
 #ifdef USE_METAL
     int h, mlp, latent, fused_dim;
 
     if (!tf || tf->use_mmap) return -1;
     if (!flux_metal_available()) return 0;  /* Keep f32 on non-Metal runtime. */
+    if (!flux_bf16_pipeline_available()) return 0;  /* No bf16 fast path to benefit from. */
 
     clear_non_mmap_bf16_weights(tf);
 
@@ -5690,6 +5731,7 @@ static int convert_merged_weights_to_bf16(flux_transformer_t *tf) {
 
     tf->use_bf16 = 1;
     warmup_bf16_weights(tf);
+    free_f32_runtime_weights_after_bf16(tf);
     return 0;
 
 fail:
