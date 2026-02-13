@@ -127,7 +127,9 @@ void flux_set_mmap(flux_ctx *ctx, int enable);
  *
  * Notes:
  * - This MVP supports standard LoRA (A/B matrices) on transformer weights.
- * - mmap is automatically disabled while LoRA is active.
+ * - LoRA merge uses f32 transformer weights.
+ * - In mmap mode, shared weights are merged at load time and block weights are
+ *   merged lazily as each block is loaded.
  */
 int flux_set_lora(flux_ctx *ctx, const char *lora_path, float scale);
 

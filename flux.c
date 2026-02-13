@@ -379,23 +379,13 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 
 /* Load transformer on-demand if not already loaded */
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
-    int use_mmap;
-
     if (ctx->transformer) return 1;  /* Already loaded */
-
-    use_mmap = ctx->use_mmap;
-    if (ctx->use_lora && use_mmap) {
-        if (flux_verbose) {
-            fprintf(stderr, "LoRA enabled: disabling mmap for transformer load\n");
-        }
-        use_mmap = 0;
-    }
 
     /* LoRA merge currently requires f32 transformer weights. */
     flux_transformer_set_force_f32(ctx->use_lora ? 1 : 0);
 
     if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
-    if (use_mmap) {
+    if (ctx->use_mmap) {
         ctx->transformer = flux_transformer_load_safetensors_mmap(ctx->model_dir);
     } else {
         ctx->transformer = flux_transformer_load_safetensors(ctx->model_dir);
