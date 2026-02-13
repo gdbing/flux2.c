@@ -5258,6 +5258,23 @@ typedef struct {
     int modules_applied;
 } lora_stats_t;
 
+typedef struct {
+    char module[256];
+    int state;  /* 1=found, 0=not found, -1=error */
+    const safetensor_t *tA;
+    const safetensor_t *tB;
+    char keyA[512];
+    char keyB[512];
+} lora_pair_cache_entry_t;
+
+#define LORA_PAIR_CACHE_MAX 512
+static lora_pair_cache_entry_t g_lora_pair_cache[LORA_PAIR_CACHE_MAX];
+static int g_lora_pair_cache_count = 0;
+
+static void lora_pair_cache_reset(void) {
+    g_lora_pair_cache_count = 0;
+}
+
 static int collect_lora_tensors(const safetensors_file_t *sf,
                                 const char *module,
                                 const char *suffixes[],
@@ -5455,6 +5472,38 @@ static int find_lora_pair(const safetensors_file_t *sf,
                              tA, tB, keyA, keyA_cap, keyB, keyB_cap);
 }
 
+static int find_lora_pair_cached(const safetensors_file_t *sf,
+                                 const char *module,
+                                 const safetensor_t **tA,
+                                 const safetensor_t **tB,
+                                 char *keyA,
+                                 size_t keyA_cap,
+                                 char *keyB,
+                                 size_t keyB_cap) {
+    for (int i = 0; i < g_lora_pair_cache_count; i++) {
+        lora_pair_cache_entry_t *e = &g_lora_pair_cache[i];
+        if (strcmp(e->module, module) == 0) {
+            *tA = e->tA;
+            *tB = e->tB;
+            if (keyA_cap > 0) snprintf(keyA, keyA_cap, "%s", e->keyA);
+            if (keyB_cap > 0) snprintf(keyB, keyB_cap, "%s", e->keyB);
+            return e->state;
+        }
+    }
+
+    int state = find_lora_pair(sf, module, tA, tB, keyA, keyA_cap, keyB, keyB_cap);
+    if (g_lora_pair_cache_count < LORA_PAIR_CACHE_MAX) {
+        lora_pair_cache_entry_t *e = &g_lora_pair_cache[g_lora_pair_cache_count++];
+        snprintf(e->module, sizeof(e->module), "%s", module);
+        e->state = state;
+        e->tA = *tA;
+        e->tB = *tB;
+        snprintf(e->keyA, sizeof(e->keyA), "%s", (keyA_cap > 0) ? keyA : "");
+        snprintf(e->keyB, sizeof(e->keyB), "%s", (keyB_cap > 0) ? keyB : "");
+    }
+    return state;
+}
+
 static int lora_validate_matrix(const safetensor_t *t,
                                 int rows, int cols,
                                 const char *name) {
@@ -5513,7 +5562,7 @@ static int apply_lora_matrix(const safetensors_file_t *sf,
     int pair_state;
     char keyA[512], keyB[512];
 
-    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    pair_state = find_lora_pair_cached(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
     if (pair_state == 0) return 0;   /* Module not present in this LoRA. */
     if (pair_state < 0) return -1;
 
@@ -5553,7 +5602,7 @@ static int apply_lora_split_linear_in(const safetensors_file_t *sf,
     int pair_state;
     char keyA[512], keyB[512];
 
-    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    pair_state = find_lora_pair_cached(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
     if (pair_state == 0) return 0;
     if (pair_state < 0) return -1;
 
@@ -5595,7 +5644,7 @@ static int apply_lora_split_qkv(const safetensors_file_t *sf,
     int pair_state;
     char keyA[512], keyB[512];
 
-    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    pair_state = find_lora_pair_cached(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
     if (pair_state == 0) return 0;
     if (pair_state < 0) return -1;
 
@@ -5787,6 +5836,7 @@ int flux_transformer_apply_lora(flux_transformer_t *tf,
         fprintf(stderr, "Failed to open LoRA file: %s\n", lora_path);
         return -1;
     }
+    lora_pair_cache_reset();
 
     h = tf->hidden_size;
     mlp = tf->mlp_hidden;
