@@ -726,6 +726,12 @@ void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
         free_single_block_weights(&tf->single_blocks[i]);
 }
 
+/* Keep mmap block weights resident across denoising steps for LoRA f32 mode.
+ * This avoids per-step load+merge overhead. */
+static int should_keep_mmap_block_weights(const flux_transformer_t *tf) {
+    return tf && tf->use_mmap && tf->lora_sf && !tf->use_bf16;
+}
+
 #ifdef USE_METAL
 /* Pre-warm bf16 weight buffer cache for all blocks (mmap mode).
  * Loads each block's bf16 mmap pointers and copies weight data to Metal
@@ -3612,7 +3618,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                        1, hidden, double_mod_size);
 
     for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand and free after use */
+        /* In mmap mode, load block weights on-demand (and optionally retain them). */
         if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
                          && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
@@ -3634,7 +3640,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
-        if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
+        if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
+            free_double_block_weights(&tf->double_blocks[i]);
+        }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
@@ -3844,7 +3852,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
-            /* In mmap mode, load block weights on-demand and free after use */
+            /* In mmap mode, load block weights on-demand (and optionally retain them). */
             if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
                              && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
                 load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
@@ -3876,7 +3884,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                      txt_rope_cos, txt_rope_sin,
                                      total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
             }
-            if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+            if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
+                free_single_block_weights(&tf->single_blocks[i]);
+            }
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -4100,7 +4110,8 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
 
     /* Double blocks - process combined image with text */
     for (int i = 0; i < tf->num_double_layers; i++) {
-        if (tf->use_mmap) {
+        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             if (tf->lora_sf && !tf->use_bf16) {
@@ -4120,7 +4131,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              combined_img_seq, txt_seq, tf);
-        if (tf->use_mmap) {
+        if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
             free_double_block_weights(&tf->double_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
         }
@@ -4136,7 +4147,8 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
-        if (tf->use_mmap) {
+        if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                         && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
             load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             if (tf->lora_sf && !tf->use_bf16) {
@@ -4155,7 +4167,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);
-        if (tf->use_mmap) {
+        if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
             free_single_block_weights(&tf->single_blocks[i]);
             /* With direct mmap pointers for bf16, no need to clear caches. */
         }
@@ -4364,7 +4376,8 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
-        if (tf->use_mmap) {
+        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             if (tf->lora_sf && !tf->use_bf16) {
@@ -4384,7 +4397,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              combined_img_seq, txt_seq, tf);
-        if (tf->use_mmap) {
+        if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
             free_double_block_weights(&tf->double_blocks[i]);
         }
         if (flux_substep_callback)
@@ -4399,7 +4412,8 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
-        if (tf->use_mmap) {
+        if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                         && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
             load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             if (tf->lora_sf && !tf->use_bf16) {
@@ -4418,7 +4432,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              combined_rope_cos, combined_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);
-        if (tf->use_mmap) {
+        if (tf->use_mmap && !should_keep_mmap_block_weights(tf)) {
             free_single_block_weights(&tf->single_blocks[i]);
         }
         if (flux_substep_callback)
