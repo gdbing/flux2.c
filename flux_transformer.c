@@ -5184,39 +5184,138 @@ typedef struct {
     int modules_applied;
 } lora_stats_t;
 
-static const safetensor_t *find_lora_tensor(const safetensors_file_t *sf,
-                                            const char *module,
-                                            const char *suffix,
-                                            char *resolved_name,
-                                            size_t resolved_cap) {
-    static const char *prefixes[] = {
-        "",
-        "diffusion_model.",
-        "base_model.model.",
-        "base_model.model.diffusion_model.",
-        "model.diffusion_model.",
-        "transformer.",
-        "base_model.model.transformer."
-    };
-    char key[512];
-    size_t i;
+static int collect_lora_tensors(const safetensors_file_t *sf,
+                                const char *module,
+                                const char *suffixes[],
+                                int *out_count,
+                                const safetensor_t **out_tensors,
+                                const char **out_names,
+                                size_t *out_root_lens,
+                                int out_cap) {
+    int count = 0;
+    int i, s;
+    char target[512];
 
-    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        snprintf(key, sizeof(key), "%s%s.%s", prefixes[i], module, suffix);
-        const safetensor_t *t = safetensors_find(sf, key);
-        if (t) {
-            if (resolved_name && resolved_cap > 0) {
-                snprintf(resolved_name, resolved_cap, "%s", key);
+    if (!sf || !module || !suffixes || !out_count || !out_tensors || !out_names ||
+        !out_root_lens || out_cap <= 0) {
+        return -1;
+    }
+
+    for (i = 0; i < sf->num_tensors; i++) {
+        const safetensor_t *t = &sf->tensors[i];
+        const char *name = t->name;
+        size_t name_len = strlen(name);
+
+        for (s = 0; suffixes[s] != NULL; s++) {
+            size_t target_len;
+            size_t root_len;
+
+            snprintf(target, sizeof(target), "%s.%s", module, suffixes[s]);
+            target_len = strlen(target);
+            if (name_len < target_len) continue;
+
+            if (strcmp(name + (name_len - target_len), target) != 0) continue;
+
+            root_len = name_len - target_len;
+            if (root_len > 0 && name[root_len - 1] != '.') continue;
+
+            if (count >= out_cap) {
+                fprintf(stderr, "LoRA candidate overflow while matching module %s\n", module);
+                return -1;
             }
-            return t;
+
+            out_tensors[count] = t;
+            out_names[count] = name;
+            out_root_lens[count] = root_len;
+            count++;
+            break;
         }
     }
-    return NULL;
+
+    *out_count = count;
+    return 0;
 }
 
-/* Find a LoRA pair using either:
- * - lora_A/lora_B
- * - lora_down/lora_up (common in kohya/Comfy exports) */
+static int lora_roots_match(const char *name_a, size_t root_a,
+                            const char *name_b, size_t root_b) {
+    if (!name_a || !name_b) return 0;
+    if (root_a != root_b) return 0;
+    if (root_a == 0) return 1;
+    return strncmp(name_a, name_b, root_a) == 0;
+}
+
+static int resolve_lora_pair(const char *module,
+                             const char *format_label,
+                             int count_a,
+                             const safetensor_t **cand_a,
+                             const char **name_a,
+                             const size_t *root_a,
+                             int count_b,
+                             const safetensor_t **cand_b,
+                             const char **name_b,
+                             const size_t *root_b,
+                             const safetensor_t **tA,
+                             const safetensor_t **tB,
+                             char *keyA,
+                             size_t keyA_cap,
+                             char *keyB,
+                             size_t keyB_cap) {
+    int ai, bi;
+    int matches = 0;
+    int first_ai = -1, first_bi = -1;
+    int bare_matches = 0;
+    int bare_ai = -1, bare_bi = -1;
+
+    if (count_a == 0 && count_b == 0) return 0;
+
+    if (count_a == 0 || count_b == 0) {
+        fprintf(stderr, "LoRA pair incomplete for module %s (expected %s)\n", module, format_label);
+        return -1;
+    }
+
+    for (ai = 0; ai < count_a; ai++) {
+        for (bi = 0; bi < count_b; bi++) {
+            if (!lora_roots_match(name_a[ai], root_a[ai], name_b[bi], root_b[bi])) continue;
+            matches++;
+            if (first_ai < 0) {
+                first_ai = ai;
+                first_bi = bi;
+            }
+            if (root_a[ai] == 0 && root_b[bi] == 0) {
+                bare_matches++;
+                if (bare_ai < 0) {
+                    bare_ai = ai;
+                    bare_bi = bi;
+                }
+            }
+        }
+    }
+
+    if (matches == 1) {
+        *tA = cand_a[first_ai];
+        *tB = cand_b[first_bi];
+        snprintf(keyA, keyA_cap, "%s", name_a[first_ai]);
+        snprintf(keyB, keyB_cap, "%s", name_b[first_bi]);
+        return 1;
+    }
+
+    if (matches > 1 && bare_matches == 1) {
+        *tA = cand_a[bare_ai];
+        *tB = cand_b[bare_bi];
+        snprintf(keyA, keyA_cap, "%s", name_a[bare_ai]);
+        snprintf(keyB, keyB_cap, "%s", name_b[bare_bi]);
+        return 1;
+    }
+
+    if (matches == 0) {
+        fprintf(stderr, "LoRA roots mismatch for module %s (%s)\n", module, format_label);
+    } else {
+        fprintf(stderr, "LoRA pair ambiguous for module %s (%s)\n", module, format_label);
+    }
+    return -1;
+}
+
+/* Find a LoRA pair using suffix matching, independent of unknown key prefixes. */
 static int find_lora_pair(const safetensors_file_t *sf,
                           const char *module,
                           const safetensor_t **tA,
@@ -5225,27 +5324,61 @@ static int find_lora_pair(const safetensors_file_t *sf,
                           size_t keyA_cap,
                           char *keyB,
                           size_t keyB_cap) {
-    *tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, keyA_cap);
-    *tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, keyB_cap);
-    if (*tA || *tB) {
-        if (!*tA || !*tB) {
-            fprintf(stderr, "LoRA pair incomplete for module %s (expected lora_A/lora_B)\n", module);
-            return -1;
-        }
-        return 1;
-    }
+    static const char *a_suffixes_ab[] = {
+        "lora_A.weight",
+        "lora_A.default.weight",
+        NULL
+    };
+    static const char *b_suffixes_ab[] = {
+        "lora_B.weight",
+        "lora_B.default.weight",
+        NULL
+    };
+    static const char *a_suffixes_du[] = {
+        "lora_down.weight",
+        "lora_down.default.weight",
+        NULL
+    };
+    static const char *b_suffixes_du[] = {
+        "lora_up.weight",
+        "lora_up.default.weight",
+        NULL
+    };
+    enum { MAX_LORA_CANDS = 64 };
+    const safetensor_t *cand_a[MAX_LORA_CANDS];
+    const safetensor_t *cand_b[MAX_LORA_CANDS];
+    const char *name_a[MAX_LORA_CANDS];
+    const char *name_b[MAX_LORA_CANDS];
+    size_t root_a[MAX_LORA_CANDS];
+    size_t root_b[MAX_LORA_CANDS];
+    int count_a = 0, count_b = 0;
+    int state;
 
-    *tA = find_lora_tensor(sf, module, "lora_down.weight", keyA, keyA_cap);
-    *tB = find_lora_tensor(sf, module, "lora_up.weight", keyB, keyB_cap);
-    if (*tA || *tB) {
-        if (!*tA || !*tB) {
-            fprintf(stderr, "LoRA pair incomplete for module %s (expected lora_down/lora_up)\n", module);
-            return -1;
-        }
-        return 1;
-    }
+    *tA = NULL;
+    *tB = NULL;
+    if (keyA_cap > 0) keyA[0] = '\0';
+    if (keyB_cap > 0) keyB[0] = '\0';
 
-    return 0;
+    if (collect_lora_tensors(sf, module, a_suffixes_ab, &count_a,
+                             cand_a, name_a, root_a, MAX_LORA_CANDS) != 0) return -1;
+    if (collect_lora_tensors(sf, module, b_suffixes_ab, &count_b,
+                             cand_b, name_b, root_b, MAX_LORA_CANDS) != 0) return -1;
+
+    state = resolve_lora_pair(module, "lora_A/lora_B",
+                              count_a, cand_a, name_a, root_a,
+                              count_b, cand_b, name_b, root_b,
+                              tA, tB, keyA, keyA_cap, keyB, keyB_cap);
+    if (state != 0) return state;
+
+    if (collect_lora_tensors(sf, module, a_suffixes_du, &count_a,
+                             cand_a, name_a, root_a, MAX_LORA_CANDS) != 0) return -1;
+    if (collect_lora_tensors(sf, module, b_suffixes_du, &count_b,
+                             cand_b, name_b, root_b, MAX_LORA_CANDS) != 0) return -1;
+
+    return resolve_lora_pair(module, "lora_down/lora_up",
+                             count_a, cand_a, name_a, root_a,
+                             count_b, cand_b, name_b, root_b,
+                             tA, tB, keyA, keyA_cap, keyB, keyB_cap);
 }
 
 static int lora_validate_matrix(const safetensor_t *t,
