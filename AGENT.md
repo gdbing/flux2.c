@@ -2,11 +2,20 @@ This is a C implementation of two image synthesis model families:
 - Flux.2 Klein (4B and 9B variants)
 - Z-Image-Turbo (6B)
 
+The project is called "Iris" (from the Greek goddess of the rainbow).
 The Flux models are created by Black Forest Labs.
 Z-Image-Turbo is published as `Tongyi-MAI/Z-Image-Turbo`.
 
 Model type and architecture are autodetected from model metadata/config files.
 Do not rely on hardcoded dimensions when a config value is available.
+
+# Naming Convention
+
+- **`iris_`** prefix for all shared/generic identifiers
+- **`_flux`** postfix on internal functions/types specific to the Flux model family
+- **`_zimage`** postfix on internal functions/types specific to Z-Image
+- **No postfix** on public API functions (they route internally by model type)
+- **Unchanged**: `qwen3_*`, `safetensors_*`, `zi_*` internal helpers (component-level namespaces)
 
 # Supported Model Variants
 
@@ -29,26 +38,26 @@ Z-Image variant:
 # File Structure
 
 ```
-flux.c                  - Main library (model load, generation routing)
-flux_transformer.c      - Flux diffusion transformer (MMDiT)
-flux_zimage_transformer.c - Z-Image transformer (S3-DiT)
-flux_sample.c           - Sampling/denoising loops (Euler ODE)
-flux_qwen3.c            - Qwen3 text encoder
-flux_qwen3_tokenizer.c  - BPE tokenizer
-flux_vae.c              - VAE encoder/decoder
-flux_kernels.c          - CPU kernels (softmax, RMSNorm, etc.)
-flux_metal.m            - Metal GPU acceleration runtime
-flux_metal.h            - Metal/GPU API surface
-flux_shaders.metal      - Metal compute kernels
-flux_safetensors.c      - Weight loading
-flux_image.c            - Image I/O (PNG/PPM/JPEG)
-png.c                   - PNG encoder/decoder
-jpeg.c                  - JPEG decoder
-flux_cli.c              - Interactive CLI mode (REPL)
-embcache.c              - Embedding cache (4-bit quantized)
-linenoise.c             - Line editing library
-terminals.c             - Terminal handling
-main.c                  - CLI entry point
+iris.c                    - Main library (model load, generation routing)
+iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
+iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
+iris_sample.c             - Sampling/denoising loops (Euler ODE)
+iris_qwen3.c              - Qwen3 text encoder
+iris_qwen3_tokenizer.c    - BPE tokenizer
+iris_vae.c                - VAE encoder/decoder
+iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
+iris_metal.m              - Metal GPU acceleration runtime
+iris_metal.h              - Metal/GPU API surface
+iris_shaders.metal        - Metal compute kernels
+iris_safetensors.c        - Weight loading
+iris_image.c              - Image I/O (PNG/PPM/JPEG)
+png.c                     - PNG encoder/decoder
+jpeg.c                    - JPEG decoder
+iris_cli.c                - Interactive CLI mode (REPL)
+embcache.c                - Embedding cache (4-bit quantized)
+linenoise.c               - Line editing library
+terminals.c               - Terminal handling
+main.c                    - CLI entry point
 ```
 
 # Build Targets
@@ -73,14 +82,14 @@ This project implements three targets:
 
 Flux examples:
 
-    ./flux -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
-    ./flux -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-4b -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-4b-base -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-9b -p "a cat and a dog playing" -o /tmp/test.png
+    ./iris -d flux-klein-9b-base -p "a cat and a dog playing" -o /tmp/test.png
 
 Z-Image example:
 
-    ./flux -d zimage-turbo -p "a fish" -o /tmp/zimage.png
+    ./iris -d zimage-turbo -p "a fish" -o /tmp/zimage.png
 
 If model weights are missing, use the download script only after user approval.
 
@@ -343,8 +352,8 @@ Important points:
 1. **MPS SGEMM B-cache misuse caused VAE decode corruption (hue/border artifacts).**
    - Root cause: generic SGEMM cached matrix B by pointer, but VAE attention K/V are dynamic temporaries.
    - Fix: split API paths:
-     - `flux_metal_sgemm`: generic path, no B-pointer cache
-     - `flux_metal_sgemm_cached`: explicit static-weight cached path
+     - `iris_metal_sgemm`: generic path, no B-pointer cache
+     - `iris_metal_sgemm_cached`: explicit static-weight cached path
    - Static weight call sites (for example linear layers) use cached variant only.
 
 2. **Scheduler parity bug with official Python implementation.**
@@ -369,17 +378,17 @@ make test
 
 Manual Flux sanity:
 ```bash
-./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
-  --seed 42 --steps 2 -o /tmp/flux_test.png -W 64 -H 64
+./iris -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 --steps 2 -o /tmp/iris_test.png -W 64 -H 64
 ```
 
 Manual Z-Image sanity:
 ```bash
-./flux -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
+./iris -d zimage-turbo -p "a fish" --seed 43 --steps 8 -o /tmp/zimage_test.png
 ```
 
 # Flux Known Pitfalls (Historical Bugs)
 
 1. **Unified RoPE kernel indexing**: GPU must use consecutive pairs `(d, d+1)`, not axis-half indexing.
 2. **GPU caching of timestep params**: step-dependent shift/scale/gate must not be cached as static weights.
-3. **CLI mode CFG routing**: base models in interactive mode must go through `flux_generate()` (CFG-aware), not distilled-only embedding path.
+3. **CLI mode CFG routing**: base models in interactive mode must go through `iris_generate()` (CFG-aware), not distilled-only embedding path.

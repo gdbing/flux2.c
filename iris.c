@@ -1,14 +1,14 @@
 /*
- * FLUX Main Implementation
+ * Iris Main Implementation
  *
- * Main entry point for the FLUX.2 klein 4B inference engine.
+ * Main entry point for the Iris inference engine.
  * Ties together all components: tokenizer, text encoder, VAE, transformer, sampling.
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_safetensors.h"
-#include "flux_qwen3.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_safetensors.h"
+#include "iris_qwen3.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,51 +16,51 @@
 #include <sys/stat.h>
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 /* ========================================================================
  * Forward Declarations for Internal Types
  * ======================================================================== */
 
-typedef struct flux_tokenizer flux_tokenizer;
-typedef struct flux_vae flux_vae_t;
-typedef struct flux_transformer flux_transformer_t;
+typedef struct iris_tokenizer iris_tokenizer;
+typedef struct iris_vae iris_vae_t;
+typedef struct iris_transformer_flux iris_transformer_flux_t;
 
 /* Internal function declarations */
-extern flux_tokenizer *flux_tokenizer_load(const char *path);
-extern void flux_tokenizer_free(flux_tokenizer *tok);
-extern int *flux_tokenize(flux_tokenizer *tok, const char *text,
+extern iris_tokenizer *iris_tokenizer_load(const char *path);
+extern void iris_tokenizer_free(iris_tokenizer *tok);
+extern int *iris_tokenize(iris_tokenizer *tok, const char *text,
                           int *num_tokens, int max_len);
 
-extern flux_vae_t *flux_vae_load(FILE *f);
-extern flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf);
-extern flux_vae_t *flux_vae_load_safetensors_ex(safetensors_file_t *sf,
+extern iris_vae_t *iris_vae_load(FILE *f);
+extern iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf);
+extern iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                                   int z_channels,
                                                   float scaling_factor,
                                                   float shift_factor);
-extern void flux_vae_free(flux_vae_t *vae);
-extern float *flux_vae_encode(flux_vae_t *vae, const float *img,
+extern void iris_vae_free(iris_vae_t *vae);
+extern float *iris_vae_encode(iris_vae_t *vae, const float *img,
                               int batch, int H, int W, int *out_h, int *out_w);
-extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
+extern iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w);
-extern float *flux_image_to_tensor(const flux_image *img);
+extern float *iris_image_to_tensor(const iris_image *img);
 
-extern flux_transformer_t *flux_transformer_load(FILE *f);
-extern flux_transformer_t *flux_transformer_load_safetensors(const char *model_dir);
-extern flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir);
-extern void flux_transformer_free(flux_transformer_t *tf);
-extern float *flux_transformer_forward(flux_transformer_t *tf,
+extern iris_transformer_flux_t *iris_transformer_load_flux(FILE *f);
+extern iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *model_dir);
+extern iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char *model_dir);
+extern void iris_transformer_free_flux(iris_transformer_flux_t *tf);
+extern float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
                                         float timestep);
 
-extern float *flux_sample_euler(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_flux(void *transformer, void *text_encoder,
                                 float *z, int batch, int channels, int h, int w,
                                 const float *text_emb, int text_seq,
                                 const float *schedule, int num_steps,
                                 void (*progress_callback)(int step, int total));
-extern float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
                                           float *z, int batch, int channels, int h, int w,
                                           const float *ref_latent, int ref_h, int ref_w,
                                           int t_offset,
@@ -73,24 +73,24 @@ typedef struct {
     const float *latent;
     int h, w;
     int t_offset;
-} flux_ref_t;
+} iris_ref_t;
 
-extern float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
                                                 float *z, int batch, int channels, int h, int w,
-                                                const flux_ref_t *refs, int num_refs,
+                                                const iris_ref_t *refs, int num_refs,
                                                 const float *text_emb, int text_seq,
                                                 const float *schedule, int num_steps,
                                                 void (*progress_callback)(int step, int total));
 
 /* CFG sampling (for base model) */
-extern float *flux_sample_euler_cfg(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
                                      float *z, int batch, int channels, int h, int w,
                                      const float *text_emb_cond, int text_seq_cond,
                                      const float *text_emb_uncond, int text_seq_uncond,
                                      float guidance_scale,
                                      const float *schedule, int num_steps,
                                      void (*progress_callback)(int step, int total));
-extern float *flux_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
                                                float *z, int batch, int channels, int h, int w,
                                                const float *ref_latent, int ref_h, int ref_w,
                                                int t_offset,
@@ -99,20 +99,20 @@ extern float *flux_sample_euler_cfg_with_refs(void *transformer, void *text_enco
                                                float guidance_scale,
                                                const float *schedule, int num_steps,
                                                void (*progress_callback)(int step, int total));
-extern float *flux_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encoder,
+extern float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encoder,
                                                      float *z, int batch, int channels, int h, int w,
-                                                     const flux_ref_t *refs, int num_refs,
+                                                     const iris_ref_t *refs, int num_refs,
                                                      const float *text_emb_cond, int text_seq_cond,
                                                      const float *text_emb_uncond, int text_seq_uncond,
                                                      float guidance_scale,
                                                      const float *schedule, int num_steps,
                                                      void (*progress_callback)(int step, int total));
 
-extern float *flux_linear_schedule(int num_steps);
-extern float *flux_power_schedule(int num_steps, float alpha);
-extern float *flux_official_schedule(int num_steps, int image_seq_len);
-extern float *flux_zimage_schedule(int num_steps, int image_seq_len);
-extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
+extern float *iris_schedule_linear(int num_steps);
+extern float *iris_schedule_power(int num_steps, float alpha);
+extern float *iris_schedule_flux(int num_steps, int image_seq_len);
+extern float *iris_schedule_zimage(int num_steps, int image_seq_len);
+extern float *iris_init_noise(int batch, int channels, int h, int w, int64_t seed);
 
 /* Z-Image transformer and sampling */
 typedef struct zi_transformer zi_transformer_t;
@@ -122,49 +122,52 @@ extern zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
                                                            int cap_feat_dim, int in_channels,
                                                            int patch_size, float rope_theta,
                                                            const int *axes_dims);
-extern void zi_transformer_free(zi_transformer_t *tf);
-extern float *flux_sample_euler_zimage(void *transformer,
+extern void iris_transformer_free_zimage(zi_transformer_t *tf);
+extern float *iris_sample_euler_zimage(void *transformer,
                                         float *z, int batch, int channels, int h, int w,
                                         int patch_size,
                                         const float *cap_feats, int cap_seq,
                                         const float *schedule, int num_steps,
                                         void (*progress_callback)(int step, int total));
 
-/* Return schedule based on params: linear, power, or official shifted sigmoid. */
-static float *flux_selected_schedule(const flux_params *p, int image_seq_len) {
-    if (p->power_schedule)
-        return flux_power_schedule(p->num_steps, p->power_alpha);
-    if (p->linear_schedule)
-        return flux_linear_schedule(p->num_steps);
-    return flux_official_schedule(p->num_steps, image_seq_len);
+/* Return schedule for Flux models based on params.
+ * Default is shifted sigmoid; overrides: linear, power, flowmatch. */
+static float *iris_selected_schedule(const iris_params *p, int image_seq_len) {
+    switch (p->schedule) {
+    case IRIS_SCHEDULE_LINEAR:    return iris_schedule_linear(p->num_steps);
+    case IRIS_SCHEDULE_POWER:     return iris_schedule_power(p->num_steps, p->power_alpha);
+    case IRIS_SCHEDULE_FLOWMATCH: return iris_schedule_zimage(p->num_steps, image_seq_len);
+    default:                      return iris_schedule_flux(p->num_steps, image_seq_len);
+    }
 }
 
-/* Return Z-Image schedule based on params.
- * Default is Z-Image FlowMatch schedule; linear/power are explicit overrides. */
-static float *flux_selected_zimage_schedule(const flux_params *p, int image_seq_len) {
-    if (p->power_schedule)
-        return flux_power_schedule(p->num_steps, p->power_alpha);
-    if (p->linear_schedule)
-        return flux_linear_schedule(p->num_steps);
-    return flux_zimage_schedule(p->num_steps, image_seq_len);
+/* Return schedule for Z-Image models based on params.
+ * Default is FlowMatch Euler; overrides: linear, power, sigmoid. */
+static float *iris_selected_zimage_schedule(const iris_params *p, int image_seq_len) {
+    switch (p->schedule) {
+    case IRIS_SCHEDULE_LINEAR:  return iris_schedule_linear(p->num_steps);
+    case IRIS_SCHEDULE_POWER:   return iris_schedule_power(p->num_steps, p->power_alpha);
+    case IRIS_SCHEDULE_SIGMOID: return iris_schedule_flux(p->num_steps, image_seq_len);
+    default:                    return iris_schedule_zimage(p->num_steps, image_seq_len);
+    }
 }
 
 /* ========================================================================
  * Text Encoder (Qwen3)
  * ======================================================================== */
 
-/* Qwen3 text encoder is implemented in flux_qwen3.c */
+/* Qwen3 text encoder is implemented in iris_qwen3.c */
 
 /* ========================================================================
  * Main Context Structure
  * ======================================================================== */
 
-struct flux_ctx {
+struct iris_ctx {
     /* Components */
-    flux_tokenizer *tokenizer;
+    iris_tokenizer *tokenizer;
     qwen3_encoder_t *qwen3_encoder;
-    flux_vae_t *vae;
-    flux_transformer_t *transformer;
+    iris_vae_t *vae;
+    iris_transformer_flux_t *transformer;
     zi_transformer_t *zi_transformer;
 
     /* Configuration */
@@ -206,13 +209,13 @@ struct flux_ctx {
 /* Global error message */
 static char g_error_msg[256] = {0};
 
-const char *flux_get_error(void) {
+const char *iris_get_error(void) {
     return g_error_msg;
 }
 
-void flux_set_step_image_callback(flux_ctx *ctx, flux_step_image_cb_t callback) {
-    flux_step_image_callback = callback;
-    flux_step_image_vae = callback ? ctx->vae : NULL;
+void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback) {
+    iris_step_image_callback = callback;
+    iris_step_image_vae = callback ? ctx->vae : NULL;
 }
 
 static void set_error(const char *msg) {
@@ -235,18 +238,18 @@ static int file_exists(const char *path) {
  * (hidden dim, heads, layers, etc.). Only the VAE (~300MB) is loaded
  * eagerly; the text encoder and transformer are deferred to generation
  * time so they can be swapped in/out on memory-constrained systems. */
-flux_ctx *flux_load_dir(const char *model_dir) {
+iris_ctx *iris_load_dir(const char *model_dir) {
     char path[1024];
 
-    flux_ctx *ctx = calloc(1, sizeof(flux_ctx));
+    iris_ctx *ctx = calloc(1, sizeof(iris_ctx));
     if (!ctx) {
         set_error("Out of memory");
         return NULL;
     }
 
     /* Set defaults - max 1792x1792 (requires ~18GB VAE work buffers) */
-    ctx->max_width = FLUX_VAE_MAX_DIM;
-    ctx->max_height = FLUX_VAE_MAX_DIM;
+    ctx->max_width = IRIS_VAE_MAX_DIM;
+    ctx->max_height = IRIS_VAE_MAX_DIM;
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
@@ -382,7 +385,7 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     }
 
     /* Read vae/config.json for Z-Image scaling/shift factors */
-    ctx->vae_z_channels = FLUX_VAE_Z_CHANNELS;  /* default: 32 */
+    ctx->vae_z_channels = IRIS_VAE_Z_CHANNELS;  /* default: 32 */
     ctx->vae_scaling = 0.0f;
     ctx->vae_shift = 0.0f;
     snprintf(path, sizeof(path), "%s/vae/config.json", model_dir);
@@ -452,7 +455,7 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     if (file_exists(path)) {
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
-            ctx->vae = flux_vae_load_safetensors_ex(sf,
+            ctx->vae = iris_vae_load_safetensors_ex(sf,
                 ctx->vae_z_channels, ctx->vae_scaling, ctx->vae_shift);
             safetensors_close(sf);
         }
@@ -461,7 +464,7 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     /* Verify VAE is loaded */
     if (!ctx->vae) {
         set_error("Failed to load VAE - cannot generate images");
-        flux_free(ctx);
+        iris_free(ctx);
         return NULL;
     }
 
@@ -472,43 +475,43 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
         if (!file_exists(path)) {
             set_error("Transformer model not found (missing config.json and safetensors)");
-            flux_free(ctx);
+            iris_free(ctx);
             return NULL;
         }
     }
     /* Text encoder and transformer are loaded on-demand to reduce peak memory. */
 
     /* Initialize RNG */
-    flux_rng_seed((uint64_t)time(NULL));
+    iris_rng_seed((uint64_t)time(NULL));
 
     return ctx;
 }
 
-void flux_free(flux_ctx *ctx) {
+void iris_free(iris_ctx *ctx) {
     if (!ctx) return;
 
-    flux_tokenizer_free(ctx->tokenizer);
+    iris_tokenizer_free(ctx->tokenizer);
     qwen3_encoder_free(ctx->qwen3_encoder);
-    flux_vae_free(ctx->vae);
-    flux_transformer_free(ctx->transformer);
-    zi_transformer_free(ctx->zi_transformer);
+    iris_vae_free(ctx->vae);
+    iris_transformer_free_flux(ctx->transformer);
+    iris_transformer_free_zimage(ctx->zi_transformer);
 
     free(ctx);
 }
 
-void flux_set_mmap(flux_ctx *ctx, int enable) {
+void iris_set_mmap(iris_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
 }
 
-int flux_is_distilled(flux_ctx *ctx) {
+int iris_is_distilled(iris_ctx *ctx) {
     return ctx ? ctx->is_distilled : 1;
 }
 
-int flux_is_zimage(flux_ctx *ctx) {
+int iris_is_zimage(iris_ctx *ctx) {
     return ctx ? ctx->is_zimage : 0;
 }
 
-void flux_set_base_mode(flux_ctx *ctx) {
+void iris_set_base_mode(iris_ctx *ctx) {
     if (!ctx) return;
     ctx->is_distilled = 0;
     ctx->default_steps = 50;
@@ -523,7 +526,7 @@ void flux_set_base_mode(flux_ctx *ctx) {
  * so this is called after text encoding and before denoising. On Metal,
  * also resets all GPU state (weight caches, pools) to avoid stale data
  * when the transformer loads into the same memory regions. */
-void flux_release_text_encoder(flux_ctx *ctx) {
+void iris_release_text_encoder(iris_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
     qwen3_encoder_free(ctx->qwen3_encoder);
@@ -532,7 +535,7 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 #ifdef USE_METAL
     /* Reset all GPU state to ensure clean slate for transformer.
      * This clears weight caches, activation pools, and pending commands. */
-    flux_metal_reset();
+    iris_metal_reset();
 #endif
 }
 
@@ -540,16 +543,16 @@ void flux_release_text_encoder(flux_ctx *ctx) {
  * generation time because the text encoder must be freed first -- both
  * are too large to fit in memory simultaneously. Once loaded, the
  * transformer persists across generations (no reload per image). */
-static int flux_load_transformer_if_needed(flux_ctx *ctx) {
+static int iris_load_transformer_if_needed(iris_ctx *ctx) {
     if (ctx->transformer) return 1;  /* Already loaded */
 
-    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 0);
+    if (iris_phase_callback) iris_phase_callback("Loading FLUX.2 transformer", 0);
     if (ctx->use_mmap) {
-        ctx->transformer = flux_transformer_load_safetensors_mmap(ctx->model_dir);
+        ctx->transformer = iris_transformer_load_safetensors_mmap_flux(ctx->model_dir);
     } else {
-        ctx->transformer = flux_transformer_load_safetensors(ctx->model_dir);
+        ctx->transformer = iris_transformer_load_safetensors_flux(ctx->model_dir);
     }
-    if (flux_phase_callback) flux_phase_callback("Loading FLUX.2 transformer", 1);
+    if (iris_phase_callback) iris_phase_callback("Loading FLUX.2 transformer", 1);
 
     if (!ctx->transformer) {
         set_error("Failed to load transformer");
@@ -559,16 +562,16 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
 }
 
 /* Load Z-Image transformer on-demand if not already loaded */
-static int flux_load_zimage_transformer_if_needed(flux_ctx *ctx) {
+static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
     if (ctx->zi_transformer) return 1;  /* Already loaded */
 
-    if (flux_phase_callback) flux_phase_callback("Loading Z-Image transformer", 0);
+    if (iris_phase_callback) iris_phase_callback("Loading Z-Image transformer", 0);
     ctx->zi_transformer = zi_transformer_load_safetensors(
         ctx->model_dir,
         ctx->zi_dim, ctx->zi_dim / 128, ctx->zi_n_layers, ctx->zi_n_refiner,
         ctx->zi_cap_feat_dim, ctx->zi_in_channels, ctx->zi_patch_size,
         ctx->zi_rope_theta, ctx->zi_axes_dims);
-    if (flux_phase_callback) flux_phase_callback("Loading Z-Image transformer", 1);
+    if (iris_phase_callback) iris_phase_callback("Loading Z-Image transformer", 1);
 
     if (!ctx->zi_transformer) {
         set_error("Failed to load Z-Image transformer");
@@ -578,7 +581,7 @@ static int flux_load_zimage_transformer_if_needed(flux_ctx *ctx) {
 }
 
 /* Get transformer for debugging */
-void *flux_get_transformer(flux_ctx *ctx) {
+void *iris_get_transformer(iris_ctx *ctx) {
     if (!ctx) return NULL;
     if (ctx->is_zimage) return ctx->zi_transformer;
     return ctx->transformer;
@@ -593,7 +596,7 @@ void *flux_get_transformer(flux_ctx *ctx) {
  * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
  * count via out_seq_len. The returned embedding buffer is still max-seq padded;
  * Z-Image consumes only the first out_seq_len tokens. */
-float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
+float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx || !prompt) {
         *out_seq_len = 0;
         return NULL;
@@ -601,9 +604,9 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
-        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
+        if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
-        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
+        if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 1);
         if (!ctx->qwen3_encoder) {
             fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
         }
@@ -625,12 +628,12 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     qwen3_set_extraction_mode(ctx->qwen3_encoder, ctx->is_zimage ? 1 : 0);
 
     /* Encode text using Qwen3 */
-    if (flux_phase_callback) flux_phase_callback("encoding text", 0);
+    if (iris_phase_callback) iris_phase_callback("encoding text", 0);
 
     int num_real_tokens = 0;
     float *embeddings = qwen3_encode_text_ex(ctx->qwen3_encoder, prompt,
                                                &num_real_tokens);
-    if (flux_phase_callback) flux_phase_callback("encoding text", 1);
+    if (iris_phase_callback) iris_phase_callback("encoding text", 1);
 
     if (ctx->is_zimage) {
         /* Z-Image: use only real tokens from the padded embedding buffer. */
@@ -652,20 +655,20 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
  * operates there. After denoising (8 NFE from 9 scheduler steps, where the
  * last step is a no-op because sigma_min=0), the output is patchified to
  * [64, H/16, W/16] for VAE decode. */
-static flux_image *flux_generate_zimage_with_embeddings(flux_ctx *ctx,
+static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
                                                           const float *text_emb,
                                                           int text_seq,
-                                                          const flux_params *p_in) {
+                                                          const iris_params *p_in) {
     if (!ctx || !text_emb || text_seq <= 0) {
         set_error("Invalid context or embeddings");
         return NULL;
     }
 
-    flux_params p;
+    iris_params p;
     if (p_in) {
         p = *p_in;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Validate dimensions */
@@ -678,16 +681,16 @@ static flux_image *flux_generate_zimage_with_embeddings(flux_ctx *ctx,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
         set_error("Image dimensions exceed maximum (1792x1792)");
         return NULL;
     }
 
     /* Release text encoder to free memory before loading transformer */
-    flux_release_text_encoder(ctx);
+    iris_release_text_encoder(ctx);
 
     /* Load Z-Image transformer on-demand (persistent across generations). */
-    if (!flux_load_zimage_transformer_if_needed(ctx)) {
+    if (!iris_load_zimage_transformer_if_needed(ctx)) {
         return NULL;
     }
 
@@ -706,14 +709,14 @@ static flux_image *flux_generate_zimage_with_embeddings(flux_ctx *ctx,
 
     /* Initialize noise at pre-patchification dimensions: [in_ch, H/8, W/8] */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, in_ch, pre_h, pre_w, seed);
+    float *z = iris_init_noise(1, in_ch, pre_h, pre_w, seed);
 
     /* Get Z-Image schedule (default FlowMatch; linear/power if explicitly requested). */
-    float *schedule = flux_selected_zimage_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_zimage_schedule(&p, image_seq_len);
 
     /* Sample using Z-Image Euler method.
      * The transformer takes [in_ch, pre_h, pre_w] and returns same shape. */
-    float *denoised = flux_sample_euler_zimage(
+    float *denoised = iris_sample_euler_zimage(
         ctx->zi_transformer, z, 1, in_ch, pre_h, pre_w,
         ps,
         text_emb, text_seq,
@@ -734,32 +737,32 @@ static flux_image *flux_generate_zimage_with_embeddings(flux_ctx *ctx,
      * where latent_ch = in_ch * ps * ps = 64 */
     int latent_ch = in_ch * ps * ps;
     float *latent = (float *)malloc(latent_ch * post_h * post_w * sizeof(float));
-    flux_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
+    iris_patchify(latent, denoised, 1, in_ch, pre_h, pre_w, ps);
     free(denoised);
 
     /* Decode latent to image */
-    flux_image *img = NULL;
+    iris_image *img = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        img = flux_vae_decode(ctx->vae, latent, 1, post_h, post_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        img = iris_vae_decode(ctx->vae, latent, 1, post_h, post_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     }
 
     free(latent);
     return img;
 }
 
-static flux_image *flux_generate_zimage(flux_ctx *ctx, const char *prompt,
-                                          const flux_params *p_in) {
+static iris_image *iris_generate_zimage(iris_ctx *ctx, const char *prompt,
+                                          const iris_params *p_in) {
     /* Encode text (Z-Image mode: extraction mode 1, single layer) */
     int text_seq;
-    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
     }
 
-    flux_image *img = flux_generate_zimage_with_embeddings(ctx, text_emb, text_seq, p_in);
+    iris_image *img = iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, p_in);
     free(text_emb);
     return img;
 }
@@ -774,8 +777,8 @@ static flux_image *flux_generate_zimage(flux_ctx *ctx, const char *prompt,
  * Euler ODE denoising (4 steps distilled / 50 steps base with CFG) followed
  * by VAE decode. For base models, an empty-prompt encoding is also produced
  * for Classifier-Free Guidance (two sequential transformer passes per step). */
-flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
-                          const flux_params *params) {
+iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
+                          const iris_params *params) {
     if (!ctx || !prompt) {
         set_error("Invalid context or prompt");
         return NULL;
@@ -783,20 +786,20 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 
     /* Route to Z-Image pipeline if appropriate */
     if (ctx->is_zimage) {
-        return flux_generate_zimage(ctx, prompt, params);
+        return iris_generate_zimage(ctx, prompt, params);
     }
 
     /* Use defaults if params is NULL */
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
+    if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
@@ -805,14 +808,14 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
         set_error("Image dimensions exceed maximum (1792x1792)");
         return NULL;
     }
 
     /* Encode text (and unconditioned text for CFG in base model) */
     int text_seq;
-    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
@@ -821,7 +824,7 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
@@ -830,10 +833,10 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     }
 
     /* Release text encoder to free ~8GB before loading transformer */
-    flux_release_text_encoder(ctx);
+    iris_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
@@ -846,25 +849,25 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 
     /* Initialize noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
 
     /* Get schedule */
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Sample */
     float *latent;
     if (ctx->is_distilled) {
-        latent = flux_sample_euler(
+        latent = iris_sample_euler_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             text_emb, text_seq,
             schedule, p.num_steps,
             NULL
         );
     } else {
-        latent = flux_sample_euler_cfg(
+        latent = iris_sample_euler_cfg_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             text_emb, text_seq,
             text_emb_uncond, text_seq_uncond,
             guidance,
@@ -884,11 +887,11 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     }
 
     /* Decode latent to image */
-    flux_image *img = NULL;
+    iris_image *img = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     }
 
     free(latent);
@@ -905,48 +908,48 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
  * Only supports distilled models and Z-Image -- base model CFG requires two
  * separate embeddings (conditioned + empty prompt) which this API doesn't
  * provide, so it would produce incorrect results. */
-flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
+iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
                                            const float *text_emb, int text_seq,
-                                           const flux_params *params) {
+                                           const iris_params *params) {
     if (!ctx || !text_emb) {
         set_error("Invalid context or embeddings");
         return NULL;
     }
 
     if (ctx->is_zimage) {
-        return flux_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
+        return iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
     }
 
     /* This API only supports the distilled (non-CFG) sampler since the
      * caller provides a single embedding.  Warn if used with a base model
      * because results will be incorrect without CFG. */
     if (!ctx->is_distilled) {
-        fprintf(stderr, "Warning: flux_generate_with_embeddings() does not "
-                        "support CFG. Use flux_generate() for base models.\n");
+        fprintf(stderr, "Warning: iris_generate_with_embeddings() does not "
+                        "support CFG. Use iris_generate() for base models.\n");
     }
 
     /* Load transformer if not already loaded */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         return NULL;
     }
 
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
+    if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
 
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
         set_error("Image dimensions exceed maximum (1792x1792)");
         return NULL;
     }
@@ -958,16 +961,16 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
 
     /* Initialize noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
 
     /* Get schedule */
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Sample - note: pre-computed embeddings only support distilled path.
      * CFG requires two embeddings which the caller doesn't provide. */
-    float *latent = flux_sample_euler(
+    float *latent = iris_sample_euler_flux(
         ctx->transformer, ctx->qwen3_encoder,
-        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq,
         schedule, p.num_steps,
         NULL  /* progress_callback */
@@ -982,11 +985,11 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     }
 
     /* Decode latent to image */
-    flux_image *img = NULL;
+    iris_image *img = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     } else {
         set_error("No VAE loaded");
         free(latent);
@@ -998,10 +1001,10 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
 }
 
 /* Generate with external embeddings and external noise */
-flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
+iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
                                                      const float *text_emb, int text_seq,
                                                      const float *noise, int noise_size,
-                                                     const flux_params *params) {
+                                                     const iris_params *params) {
     if (!ctx || !text_emb || !noise) {
         set_error("Invalid context, embeddings, or noise");
         return NULL;
@@ -1009,32 +1012,32 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
 
     if (ctx->is_zimage) {
         set_error("Z-Image does not support external embedding/noise generation API. "
-                  "Use flux_generate() with a prompt.");
+                  "Use iris_generate() with a prompt.");
         return NULL;
     }
 
     /* Load transformer if not already loaded */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         return NULL;
     }
 
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
+    if (p.width <= 0) p.width = IRIS_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = IRIS_DEFAULT_HEIGHT;
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
 
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
         set_error("Image dimensions exceed maximum (1792x1792)");
         return NULL;
     }
@@ -1043,7 +1046,7 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     int latent_h = p.height / 16;
     int latent_w = p.width / 16;
     int image_seq_len = latent_h * latent_w;
-    int expected_noise_size = FLUX_LATENT_CHANNELS * latent_h * latent_w;
+    int expected_noise_size = IRIS_LATENT_CHANNELS * latent_h * latent_w;
 
     if (noise_size != expected_noise_size) {
         char err[256];
@@ -1058,12 +1061,12 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     memcpy(z, noise, expected_noise_size * sizeof(float));
 
     /* Get schedule */
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Sample */
-    float *latent = flux_sample_euler(
+    float *latent = iris_sample_euler_flux(
         ctx->transformer, ctx->qwen3_encoder,
-        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq,
         schedule, p.num_steps,
         NULL  /* progress_callback */
@@ -1078,11 +1081,11 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     }
 
     /* Decode latent to image */
-    flux_image *img = NULL;
+    iris_image *img = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     } else {
         set_error("No VAE loaded");
         free(latent);
@@ -1170,8 +1173,8 @@ static int fit_refs_for_attention(int num_heads,
  * is fundamentally different from traditional img2img that adds noise to the
  * encoded image. References are dynamically resized if the resulting attention
  * matrix would exceed the 4GB MPS memory limit. */
-flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
-                         const flux_image *input, const flux_params *params) {
+iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
+                         const iris_image *input, const iris_params *params) {
     if (!ctx || !prompt || !input) {
         set_error("Invalid parameters");
         return NULL;
@@ -1181,11 +1184,11 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Use input image dimensions if not specified */
@@ -1193,8 +1196,8 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     if (p.height <= 0) p.height = input->height;
 
     /* Clamp to VAE max dimensions, preserving aspect ratio */
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        float scale = (float)FLUX_VAE_MAX_DIM /
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
@@ -1209,7 +1212,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     {
         int ref_dims[2] = { p.height, p.width };
         if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                    ref_dims, 1, FLUX_MAX_SEQ_LEN)) {
+                                    ref_dims, 1, IRIS_MAX_SEQ_LEN)) {
             fprintf(stderr, "Note: reference image resized from %dx%d to %dx%d "
                     "(GPU attention memory limit)\n",
                     p.width, p.height, ref_dims[1], ref_dims[0]);
@@ -1219,10 +1222,10 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     }
 
     /* Resize input if needed */
-    flux_image *resized = NULL;
-    const flux_image *img_to_use = input;
+    iris_image *resized = NULL;
+    const iris_image *img_to_use = input;
     if (input->width != ref_w || input->height != ref_h) {
-        resized = flux_image_resize(input, ref_w, ref_h);
+        resized = iris_image_resize(input, ref_w, ref_h);
         if (!resized) {
             set_error("Failed to resize input image");
             return NULL;
@@ -1236,9 +1239,9 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 
     /* Encode text */
     int text_seq;
-    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
-        if (resized) flux_image_free(resized);
+        if (resized) iris_image_free(resized);
         set_error("Failed to encode prompt");
         return NULL;
     }
@@ -1246,46 +1249,46 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
-            if (resized) flux_image_free(resized);
+            if (resized) iris_image_free(resized);
             set_error("Failed to encode empty prompt for CFG");
             return NULL;
         }
     }
 
     /* Release text encoder to free ~8GB before loading transformer */
-    flux_release_text_encoder(ctx);
+    iris_release_text_encoder(ctx);
 
     /* Load transformer now (after text encoder is freed to reduce peak memory) */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
-        if (resized) flux_image_free(resized);
+        if (resized) iris_image_free(resized);
         return NULL;
     }
 
     /* Encode image to latent */
-    if (flux_phase_callback) flux_phase_callback("encoding reference image", 0);
-    float *img_tensor = flux_image_to_tensor(img_to_use);
-    if (resized) flux_image_free(resized);
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 0);
+    float *img_tensor = iris_image_to_tensor(img_to_use);
+    if (resized) iris_image_free(resized);
 
     int latent_h, latent_w;
     float *img_latent = NULL;
 
     if (ctx->vae) {
-        img_latent = flux_vae_encode(ctx->vae, img_tensor, 1,
+        img_latent = iris_vae_encode(ctx->vae, img_tensor, 1,
                                      ref_h, ref_w, &latent_h, &latent_w);
     } else {
         /* Placeholder if no VAE */
         latent_h = ref_h / 16;
         latent_w = ref_w / 16;
-        img_latent = (float *)calloc(FLUX_LATENT_CHANNELS * latent_h * latent_w, sizeof(float));
+        img_latent = (float *)calloc(IRIS_LATENT_CHANNELS * latent_h * latent_w, sizeof(float));
     }
 
     free(img_tensor);
-    if (flux_phase_callback) flux_phase_callback("encoding reference image", 1);
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 1);
 
     if (!img_latent) {
         free(text_emb);
@@ -1311,11 +1314,11 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     int image_seq_len = out_lat_h * out_lat_w;  /* For schedule calculation */
 
     /* Get schedule */
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Initialize target latent with pure noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
 
     /* Reference image latent is img_latent, with T offset = 10 */
     int t_offset = 10;
@@ -1323,9 +1326,9 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     /* Sample using in-context conditioning */
     float *latent;
     if (ctx->is_distilled) {
-        latent = flux_sample_euler_with_refs(
+        latent = iris_sample_euler_refs_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+            z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
             img_latent, latent_h, latent_w,
             t_offset,
             text_emb, text_seq,
@@ -1333,9 +1336,9 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
             NULL
         );
     } else {
-        latent = flux_sample_euler_cfg_with_refs(
+        latent = iris_sample_euler_cfg_refs_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, out_lat_h, out_lat_w,
+            z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
             img_latent, latent_h, latent_w,
             t_offset,
             text_emb, text_seq,
@@ -1358,11 +1361,11 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     }
 
     /* Decode */
-    flux_image *result = NULL;
+    iris_image *result = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        result = flux_vae_decode(ctx->vae, latent, 1, out_lat_h, out_lat_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, out_lat_h, out_lat_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     }
 
     free(latent);
@@ -1378,9 +1381,9 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
  * each reference is VAE-encoded with a distinct RoPE T offset (10, 20, 30...)
  * so the transformer can distinguish them spatially. All reference latents
  * participate in joint attention alongside the noised target tokens. */
-flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
-                          const flux_image **refs, int num_refs,
-                          const flux_params *params) {
+iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
+                          const iris_image **refs, int num_refs,
+                          const iris_params *params) {
     if (!ctx || !prompt) {
         set_error("Invalid parameters");
         return NULL;
@@ -1392,19 +1395,19 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     /* No references - text-to-image */
     if (!refs || num_refs == 0) {
-        return flux_generate(ctx, prompt, params);
+        return iris_generate(ctx, prompt, params);
     }
 
     /* Single reference - use optimized path */
     if (num_refs == 1) {
-        return flux_img2img(ctx, prompt, refs[0], params);
+        return iris_img2img(ctx, prompt, refs[0], params);
     }
 
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Use first reference dimensions if not specified */
@@ -1412,8 +1415,8 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     if (p.height <= 0) p.height = refs[0]->height;
 
     /* Clamp to VAE max dimensions */
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        float scale = (float)FLUX_VAE_MAX_DIM /
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
@@ -1428,7 +1431,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     /* Encode text */
     int text_seq;
-    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
         set_error("Failed to encode prompt");
         return NULL;
@@ -1437,7 +1440,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     float *text_emb_uncond = NULL;
     int text_seq_uncond = 0;
     if (!ctx->is_distilled) {
-        text_emb_uncond = flux_encode_text(ctx, "", &text_seq_uncond);
+        text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
             set_error("Failed to encode empty prompt for CFG");
@@ -1445,9 +1448,9 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         }
     }
 
-    flux_release_text_encoder(ctx);
+    iris_release_text_encoder(ctx);
 
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
         return NULL;
@@ -1458,8 +1461,8 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     for (int i = 0; i < num_refs; i++) {
         int rh = (refs[i]->height / 16) * 16;
         int rw = (refs[i]->width / 16) * 16;
-        if (rh > FLUX_VAE_MAX_DIM) rh = FLUX_VAE_MAX_DIM;
-        if (rw > FLUX_VAE_MAX_DIM) rw = FLUX_VAE_MAX_DIM;
+        if (rh > IRIS_VAE_MAX_DIM) rh = IRIS_VAE_MAX_DIM;
+        if (rw > IRIS_VAE_MAX_DIM) rw = IRIS_VAE_MAX_DIM;
         if (rh < 16) rh = 16;
         if (rw < 16) rw = 16;
         ref_pixel_dims[i*2]   = rh;
@@ -1468,31 +1471,31 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     /* Shrink references if attention would exceed 4 GB. */
     if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                ref_pixel_dims, num_refs, FLUX_MAX_SEQ_LEN)) {
+                                ref_pixel_dims, num_refs, IRIS_MAX_SEQ_LEN)) {
         fprintf(stderr,
                 "Note: reference images resized to fit GPU attention "
                 "memory limit\n");
     }
 
     /* Encode all reference images */
-    flux_ref_t *ref_latents = (flux_ref_t *)malloc(num_refs * sizeof(flux_ref_t));
+    iris_ref_t *ref_latents = (iris_ref_t *)malloc(num_refs * sizeof(iris_ref_t));
     float **ref_data = (float **)malloc(num_refs * sizeof(float *));
-    flux_image **resized_imgs = (flux_image **)calloc(num_refs, sizeof(flux_image *));
+    iris_image **resized_imgs = (iris_image **)calloc(num_refs, sizeof(iris_image *));
 
     for (int i = 0; i < num_refs; i++) {
-        const flux_image *ref = refs[i];
-        const flux_image *img_to_use = ref;
+        const iris_image *ref = refs[i];
+        const iris_image *img_to_use = ref;
 
         int ref_h = ref_pixel_dims[i*2];
         int ref_w = ref_pixel_dims[i*2+1];
 
         /* Resize only if dimensions differ from original */
         if (ref->width != ref_w || ref->height != ref_h) {
-            resized_imgs[i] = flux_image_resize(ref, ref_w, ref_h);
+            resized_imgs[i] = iris_image_resize(ref, ref_w, ref_h);
             if (!resized_imgs[i]) {
                 for (int j = 0; j < i; j++) {
                     free(ref_data[j]);
-                    if (resized_imgs[j]) flux_image_free(resized_imgs[j]);
+                    if (resized_imgs[j]) iris_image_free(resized_imgs[j]);
                 }
                 free(ref_latents);
                 free(ref_data);
@@ -1507,9 +1510,9 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         }
 
         /* Encode to latent at reference's own size */
-        float *tensor = flux_image_to_tensor(img_to_use);
+        float *tensor = iris_image_to_tensor(img_to_use);
         int lat_h, lat_w;
-        ref_data[i] = flux_vae_encode(ctx->vae, tensor, 1,
+        ref_data[i] = iris_vae_encode(ctx->vae, tensor, 1,
                                        img_to_use->height, img_to_use->width,
                                        &lat_h, &lat_w);
         free(tensor);
@@ -1517,9 +1520,9 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
         if (!ref_data[i]) {
             for (int j = 0; j < i; j++) {
                 free(ref_data[j]);
-                if (resized_imgs[j]) flux_image_free(resized_imgs[j]);
+                if (resized_imgs[j]) iris_image_free(resized_imgs[j]);
             }
-            if (resized_imgs[i]) flux_image_free(resized_imgs[i]);
+            if (resized_imgs[i]) iris_image_free(resized_imgs[i]);
             free(ref_latents);
             free(ref_data);
             free(resized_imgs);
@@ -1538,7 +1541,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
 
     /* Free resized images (latents are now encoded) */
     for (int i = 0; i < num_refs; i++) {
-        if (resized_imgs[i]) flux_image_free(resized_imgs[i]);
+        if (resized_imgs[i]) iris_image_free(resized_imgs[i]);
     }
     free(resized_imgs);
     free(ref_pixel_dims);
@@ -1547,25 +1550,25 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     int latent_w = p.width / 16;
     int image_seq_len = latent_h * latent_w;
 
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
 
     /* Sample with multi-reference conditioning */
     float *latent;
     if (ctx->is_distilled) {
-        latent = flux_sample_euler_with_multi_refs(
+        latent = iris_sample_euler_multirefs_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             ref_latents, num_refs,
             text_emb, text_seq,
             schedule, p.num_steps,
             NULL
         );
     } else {
-        latent = flux_sample_euler_cfg_with_multi_refs(
+        latent = iris_sample_euler_cfg_multirefs_flux(
             ctx->transformer, ctx->qwen3_encoder,
-            z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+            z, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
             ref_latents, num_refs,
             text_emb, text_seq,
             text_emb_uncond, text_seq_uncond,
@@ -1592,11 +1595,11 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
     }
 
     /* Decode */
-    flux_image *result = NULL;
+    iris_image *result = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        result = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     }
 
     free(latent);
@@ -1607,11 +1610,11 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
  * Utility Functions
  * ======================================================================== */
 
-void flux_set_seed(int64_t seed) {
-    flux_rng_seed((uint64_t)seed);
+void iris_set_seed(int64_t seed) {
+    iris_rng_seed((uint64_t)seed);
 }
 
-const char *flux_model_info(flux_ctx *ctx) {
+const char *iris_model_info(iris_ctx *ctx) {
     static char info[256];
     const char *type;
     if (!ctx) {
@@ -1626,11 +1629,11 @@ const char *flux_model_info(flux_ctx *ctx) {
     return info;
 }
 
-int flux_text_dim(flux_ctx *ctx) {
+int iris_text_dim(iris_ctx *ctx) {
     return ctx ? ctx->text_dim : 7680;
 }
 
-int flux_is_non_commercial(flux_ctx *ctx) {
+int iris_is_non_commercial(iris_ctx *ctx) {
     return ctx ? ctx->is_non_commercial : 0;
 }
 
@@ -1641,17 +1644,17 @@ int flux_is_non_commercial(flux_ctx *ctx) {
 /* Public API: VAE-encode an RGB image to latent space. Converts the image
  * to a float tensor, runs the VAE encoder, and returns the latent buffer
  * with dimensions in out_h/out_w (each 1/16 of the pixel dimensions). */
-float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
+float *iris_encode_image(iris_ctx *ctx, const iris_image *img,
                          int *out_h, int *out_w) {
     if (!ctx || !img || !ctx->vae) {
         *out_h = *out_w = 0;
         return NULL;
     }
 
-    float *tensor = flux_image_to_tensor(img);
+    float *tensor = iris_image_to_tensor(img);
     if (!tensor) return NULL;
 
-    float *latent = flux_vae_encode(ctx->vae, tensor, 1,
+    float *latent = iris_vae_encode(ctx->vae, tensor, 1,
                                     img->height, img->width, out_h, out_w);
     free(tensor);
     return latent;
@@ -1659,42 +1662,42 @@ float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
 
 /* Public API: VAE-decode a latent tensor back to an RGB image.
  * Latent dimensions are 1/16 of the output pixel dimensions. */
-flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
+iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
                                int latent_h, int latent_w) {
     if (!ctx || !latent || !ctx->vae) return NULL;
-    if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-    flux_image *img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-    if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+    if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+    iris_image *img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     return img;
 }
 
-float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
+float *iris_denoise_step(iris_ctx *ctx, const float *z, float t,
                          const float *text_emb, int text_len,
                          int latent_h, int latent_w) {
     if (!ctx || !z || !text_emb) return NULL;
 
     /* Load transformer if not already loaded */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         return NULL;
     }
 
-    return flux_transformer_forward(ctx->transformer,
+    return iris_transformer_forward_flux(ctx->transformer,
                                     z, latent_h, latent_w,
                                     text_emb, text_len, t);
 }
 
 /* Debug function: img2img with external inputs from Python */
-flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
+iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
     if (!ctx) {
         set_error("Invalid context");
         return NULL;
     }
 
-    flux_params p;
+    iris_params p;
     if (params) {
         p = *params;
     } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
     }
 
     /* Load Python's noise */
@@ -1745,7 +1748,7 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
             txt_size, text_seq, txt_size / text_seq);
 
     /* Load transformer */
-    if (!flux_load_transformer_if_needed(ctx)) {
+    if (!iris_load_transformer_if_needed(ctx)) {
         free(noise);
         free(ref_latent);
         free(text_emb);
@@ -1758,12 +1761,12 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
     int image_seq_len = latent_h * latent_w;
 
     /* Get schedule */
-    float *schedule = flux_selected_schedule(&p, image_seq_len);
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
 
     /* Sample with refs */
-    float *latent = flux_sample_euler_with_refs(
+    float *latent = iris_sample_euler_refs_flux(
         ctx->transformer, NULL,
-        noise, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        noise, 1, IRIS_LATENT_CHANNELS, latent_h, latent_w,
         ref_latent, latent_h, latent_w,
         10,  /* t_offset */
         text_emb, text_seq,
@@ -1782,11 +1785,11 @@ flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
     }
 
     /* Decode */
-    flux_image *result = NULL;
+    iris_image *result = NULL;
     if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        result = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     }
 
     free(latent);

@@ -1,5 +1,5 @@
 /*
- * flux_shaders.metal - Metal compute shaders for FLUX inference
+ * iris_shaders.metal - Metal compute shaders for Iris inference
  *
  * These kernels accelerate operations that run on CPU otherwise:
  * - RMSNorm (used in QK normalization)

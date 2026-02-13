@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FLUX test runner - verifies inference correctness against reference images.
-Usage: python3 run_test.py [--flux-binary PATH] [--full]
+Iris test runner - verifies inference correctness against reference images.
+Usage: python3 run_test.py [--binary PATH] [--full]
 """
 
 import argparse
@@ -117,7 +117,7 @@ def detect_zimage_model_dir(explicit_dir: Optional[str]) -> Optional[Path]:
     return None
 
 
-def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
+def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     """Run a single test case. Returns (passed, message)."""
     if "output" in test:
         output_path = test["output"]
@@ -126,7 +126,7 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
             output_path = f.name
 
     cmd = [
-        flux_binary,
+        binary,
         "-d", model_dir,
         "-p", test["prompt"],
         "--seed", str(test["seed"]),
@@ -143,11 +143,11 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            return False, f"flux exited with code {result.returncode}: {result.stderr}"
+            return False, f"process exited with code {result.returncode}: {result.stderr}"
     except subprocess.TimeoutExpired:
         return False, "timeout (300s)"
     except FileNotFoundError:
-        return False, f"binary not found: {flux_binary}"
+        return False, f"binary not found: {binary}"
 
     # If the test has no reference image, it's a visual-check-only test.
     if "reference" not in test:
@@ -190,8 +190,8 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run FLUX inference tests")
-    parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
+    parser = argparse.ArgumentParser(description="Run Iris inference tests")
+    parser.add_argument("--flux-binary", default="./iris", help="Path to iris binary")
     parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
     parser.add_argument("--zimage-model-dir", default=None,
                         help="Optional Z-Image model dir (auto-detected if omitted)")
@@ -241,7 +241,7 @@ def main():
         print(f"[{j}/{total}] {test['name']}...")
 
         # Step 1: Generate a reference image to use as img2img input.
-        ref_path = "/tmp/flux_test_ref_1024.png"
+        ref_path = "/tmp/iris_test_ref_1024.png"
         print(f"    Step 1: Generating 1024x1024 reference image...")
         ref_cmd = [
             args.flux_binary, "-d", args.model_dir,
@@ -264,7 +264,7 @@ def main():
 
         # Step 2: Run img2img with the reference — this should trigger
         # the attention budget shrinking and print a resize note.
-        output_path = "/tmp/flux_test_img2img_1024.png"
+        output_path = "/tmp/iris_test_img2img_1024.png"
         print(f"    Step 2: Running img2img with attention budget "
               f"shrinking (reference should be auto-resized)...")
         test_with_input = dict(test)

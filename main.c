@@ -1,10 +1,10 @@
 /*
- * FLUX CLI Application
+ * Iris CLI Application
  *
- * Command-line interface for FLUX.2 klein 4B image generation.
+ * Command-line interface for image generation.
  *
  * Usage:
- *   flux -d model/ -p "prompt" -o output.png [options]
+ *   iris -d model/ -p "prompt" -o output.png [options]
  *
  * Options:
  *   -d, --dir PATH        Path to model directory (safetensors)
@@ -20,9 +20,9 @@
  *   -h, --help            Show help
  */
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_cli.h"
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_cli.h"
 #include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 #ifdef USE_METAL
-#include "flux_metal.h"
+#include "iris_metal.h"
 #endif
 
 #ifdef USE_BLAS
@@ -89,21 +89,21 @@ static void cli_step_callback(int step, int total) {
 }
 
 /* Called for each substep within transformer forward */
-static void cli_substep_callback(flux_substep_type_t type, int index, int total) {
+static void cli_substep_callback(iris_substep_type_t type, int index, int total) {
     if (output_level == OUTPUT_QUIET) return;
     (void)total;
 
     switch (type) {
-        case FLUX_SUBSTEP_DOUBLE_BLOCK:
+        case IRIS_SUBSTEP_DOUBLE_BLOCK:
             fputc('d', stderr);
             break;
-        case FLUX_SUBSTEP_SINGLE_BLOCK:
+        case IRIS_SUBSTEP_SINGLE_BLOCK:
             /* Print 's' every 5 single blocks to avoid too much output */
             if ((index + 1) % 5 == 0) {
                 fputc('s', stderr);
             }
             break;
-        case FLUX_SUBSTEP_FINAL_LAYER:
+        case IRIS_SUBSTEP_FINAL_LAYER:
             fputc('F', stderr);
             break;
     }
@@ -152,7 +152,7 @@ static void cli_phase_callback(const char *phase, int done) {
 
 /* Set up CLI progress callbacks */
 /* Step image callback - display intermediate images in terminal */
-static void cli_step_image_callback(int step, int total, const flux_image *img) {
+static void cli_step_image_callback(int step, int total, const iris_image *img) {
     (void)total;
     fprintf(stderr, "\n[Step %d]\n", step);
     terminal_display_image(img, cli_graphics_proto);
@@ -162,9 +162,9 @@ static void cli_setup_progress(void) {
     cli_current_step = 0;
     cli_legend_printed = 0;
     cli_current_phase = NULL;
-    flux_step_callback = cli_step_callback;
-    flux_substep_callback = cli_substep_callback;
-    flux_phase_callback = cli_phase_callback;
+    iris_step_callback = cli_step_callback;
+    iris_substep_callback = cli_substep_callback;
+    iris_phase_callback = cli_phase_callback;
 }
 
 /* Clean up after generation (print final newline) */
@@ -173,9 +173,9 @@ static void cli_finish_progress(void) {
         fprintf(stderr, "\n");
         cli_current_step = 0;
     }
-    flux_step_callback = NULL;
-    flux_substep_callback = NULL;
-    flux_phase_callback = NULL;
+    iris_step_callback = NULL;
+    iris_substep_callback = NULL;
+    iris_phase_callback = NULL;
 }
 
 /* ========================================================================
@@ -216,7 +216,7 @@ static double timer_end(void) {
 #define MAX_INPUT_IMAGES 16
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "FLUX.2 klein - Pure C Image Generation\n\n");
+    fprintf(stderr, "Iris - C Image Generation\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d, --dir PATH        Path to model directory\n");
@@ -228,9 +228,11 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)\n");
     fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
-    fprintf(stderr, "      --linear          Use linear timestep schedule (default: shifted sigmoid)\n");
+    fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
-    fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n\n");
+    fprintf(stderr, "      --power-alpha N   Set power schedule exponent (default: 2.0)\n");
+    fprintf(stderr, "      --sigmoid         Use Flux shifted sigmoid schedule\n");
+    fprintf(stderr, "      --flowmatch       Use Z-Image FlowMatch Euler schedule\n\n");
     fprintf(stderr, "Model options:\n");
     fprintf(stderr, "      --base            Force base model mode (undistilled, CFG enabled)\n\n");
     fprintf(stderr, "Reference images (img2img / multi-reference):\n");
@@ -261,7 +263,7 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
-    flux_metal_init();
+    iris_metal_init();
 #endif
 
     /* Command line options */
@@ -290,6 +292,8 @@ int main(int argc, char *argv[]) {
         {"linear",     no_argument,       0, 'L'},
         {"power",      no_argument,       0, 256},
         {"power-alpha",required_argument, 0, 257},
+        {"sigmoid",    no_argument,       0, 260},
+        {"flowmatch",  no_argument,       0, 261},
         {"debug-py",   no_argument,       0, 'D'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
@@ -305,7 +309,7 @@ int main(int argc, char *argv[]) {
     char *embeddings_path = NULL;
     char *noise_path = NULL;
 
-    flux_params params = {
+    iris_params params = {
         .width = DEFAULT_WIDTH,
         .height = DEFAULT_HEIGHT,
         .num_steps = 0,   /* 0 = auto from model type */
@@ -346,10 +350,10 @@ int main(int argc, char *argv[]) {
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
-            case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
+            case 'v': output_level = OUTPUT_VERBOSE; iris_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
-                fprintf(stderr, "FLUX.2 klein v1.0.0\n");
+                fprintf(stderr, "Iris v1.0.0\n");
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
@@ -357,9 +361,11 @@ int main(int argc, char *argv[]) {
             case 'K': show_steps = 1; break;
             case 'z': terminal_set_zoom(atoi(optarg)); break;
             case 'B': force_base = 1; break;
-            case 'L': params.linear_schedule = 1; break;
-            case 256: params.power_schedule = 1; break;
-            case 257: params.power_alpha = atof(optarg); params.power_schedule = 1; break;
+            case 'L': params.schedule = IRIS_SCHEDULE_LINEAR; break;
+            case 256: params.schedule = IRIS_SCHEDULE_POWER; break;
+            case 257: params.power_alpha = atof(optarg); params.schedule = IRIS_SCHEDULE_POWER; break;
+            case 260: params.schedule = IRIS_SCHEDULE_SIGMOID; break;
+            case 261: params.schedule = IRIS_SCHEDULE_FLOWMATCH; break;
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 259: blas_threads = atoi(optarg); break;
@@ -377,7 +383,7 @@ int main(int argc, char *argv[]) {
     /* Backend banner (suppressed by --quiet) */
     if (output_level != OUTPUT_QUIET) {
 #ifdef USE_METAL
-        if (flux_metal_available()) {
+        if (iris_metal_available()) {
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             char cpu_brand[128] = "Apple Silicon";
             size_t len = sizeof(cpu_brand);
@@ -439,8 +445,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Height must be between 64 and 4096\n");
         return 1;
     }
-    if (steps_set && (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS)) {
-        fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
+    if (steps_set && (params.num_steps < 1 || params.num_steps > IRIS_MAX_STEPS)) {
+        fprintf(stderr, "Error: Steps must be between 1 and %d\n", IRIS_MAX_STEPS);
         return 1;
     }
 
@@ -451,11 +457,11 @@ int main(int argc, char *argv[]) {
     } else {
         actual_seed = (int64_t)time(NULL);
     }
-    flux_set_seed(actual_seed);
+    iris_set_seed(actual_seed);
     LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
 
     /* Verbose header */
-    LOG_VERBOSE("FLUX.2 klein Image Generator\n");
+    LOG_VERBOSE("Iris Image Generator\n");
     LOG_VERBOSE("================================\n");
     LOG_VERBOSE("Model: %s\n", model_dir);
     if (prompt) LOG_VERBOSE("Prompt: %s\n", prompt);
@@ -475,43 +481,43 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    flux_ctx *ctx = flux_load_dir(model_dir);
+    iris_ctx *ctx = iris_load_dir(model_dir);
     if (!ctx) {
-        fprintf(stderr, "\nError: Failed to load model: %s\n", flux_get_error());
+        fprintf(stderr, "\nError: Failed to load model: %s\n", iris_get_error());
         return 1;
     }
 
     /* Enable mmap mode if requested (reduces memory, slower inference) */
     if (use_mmap) {
-        flux_set_mmap(ctx, 1);
+        iris_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
 
     /* Override model type if --base was specified */
     if (force_base) {
-        flux_set_base_mode(ctx);
+        iris_set_base_mode(ctx);
     }
 
     /* Resolve auto-parameters now that we know the model type */
     if (!steps_set || params.num_steps <= 0) {
-        if (flux_is_zimage(ctx))
+        if (iris_is_zimage(ctx))
             params.num_steps = 9;  /* Z-Image-Turbo: 9 scheduler steps (8 NFE) */
         else
-            params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
+            params.num_steps = iris_is_distilled(ctx) ? 4 : 50;
     }
     if (params.guidance <= 0) {
-        if (flux_is_zimage(ctx))
+        if (iris_is_zimage(ctx))
             params.guidance = 0.0f;
         else
-            params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
+            params.guidance = iris_is_distilled(ctx) ? 1.0f : 4.0f;
     }
 
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
-    LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
+    LOG_NORMAL("Model: %s\n", iris_model_info(ctx));
 
     /* Non-commercial license warning for 9B model */
-    if (flux_is_non_commercial(ctx) && !no_license_info
+    if (iris_is_non_commercial(ctx) && !no_license_info
         && output_level != OUTPUT_QUIET) {
         fprintf(stderr,
             "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
@@ -523,8 +529,8 @@ int main(int argc, char *argv[]) {
 
     /* Interactive mode: start REPL */
     if (interactive_mode) {
-        int rc = flux_cli_run(ctx, model_dir);
-        flux_free(ctx);
+        int rc = iris_cli_run(ctx, model_dir);
+        iris_free(ctx);
         return rc;
     }
 
@@ -539,32 +545,32 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, iTerm2, WezTerm, or Konsole)\n");
         } else {
             cli_graphics_proto = graphics_proto;
-            flux_set_step_image_callback(ctx, cli_step_image_callback);
+            iris_set_step_image_callback(ctx, cli_step_image_callback);
         }
     }
 
     /* Generate image */
-    flux_image *output = NULL;
+    iris_image *output = NULL;
     struct timeval total_start_tv;
     gettimeofday(&total_start_tv, NULL);
 
     if (debug_py) {
         /* ============== Debug mode: use Python inputs ============== */
         LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
-        output = flux_img2img_debug_py(ctx, &params);
+        output = iris_img2img_debug_py(ctx, &params);
     } else if (num_inputs > 0) {
         /* ============== Image-to-image mode (single or multi-reference) ============== */
         LOG_NORMAL("Loading %d input image%s...", num_inputs, num_inputs > 1 ? "s" : "");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
         timer_begin();
 
-        flux_image *inputs[MAX_INPUT_IMAGES];
+        iris_image *inputs[MAX_INPUT_IMAGES];
         for (int i = 0; i < num_inputs; i++) {
-            inputs[i] = flux_image_load(input_paths[i]);
+            inputs[i] = iris_image_load(input_paths[i]);
             if (!inputs[i]) {
                 fprintf(stderr, "\nError: Failed to load input image: %s\n", input_paths[i]);
-                for (int j = 0; j < i; j++) flux_image_free(inputs[j]);
-                flux_free(ctx);
+                for (int j = 0; j < i; j++) iris_image_free(inputs[j]);
+                iris_free(ctx);
                 return 1;
             }
         }
@@ -580,10 +586,10 @@ int main(int argc, char *argv[]) {
         if (!height_set) params.height = inputs[0]->height;
 
         /* Generate with multi-reference */
-        output = flux_multiref(ctx, prompt, (const flux_image **)inputs, num_inputs, &params);
+        output = iris_multiref(ctx, prompt, (const iris_image **)inputs, num_inputs, &params);
 
         for (int i = 0; i < num_inputs; i++) {
-            flux_image_free(inputs[i]);
+            iris_image_free(inputs[i]);
         }
 
     } else if (embeddings_path) {
@@ -595,7 +601,7 @@ int main(int argc, char *argv[]) {
         FILE *emb_file = fopen(embeddings_path, "rb");
         if (!emb_file) {
             fprintf(stderr, "\nError: Failed to open embeddings file: %s\n", embeddings_path);
-            flux_free(ctx);
+            iris_free(ctx);
             return 1;
         }
 
@@ -603,7 +609,7 @@ int main(int argc, char *argv[]) {
         long file_size = ftell(emb_file);
         fseek(emb_file, 0, SEEK_SET);
 
-        int text_dim = flux_text_dim(ctx);
+        int text_dim = iris_text_dim(ctx);
         int text_seq = file_size / (text_dim * sizeof(float));
 
         float *text_emb = (float *)malloc(file_size);
@@ -611,7 +617,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "\nError: Failed to read embeddings file\n");
             free(text_emb);
             fclose(emb_file);
-            flux_free(ctx);
+            iris_free(ctx);
             return 1;
         }
         fclose(emb_file);
@@ -630,7 +636,7 @@ int main(int argc, char *argv[]) {
             if (!noise_file) {
                 fprintf(stderr, "Error: Failed to open noise file: %s\n", noise_path);
                 free(text_emb);
-                flux_free(ctx);
+                iris_free(ctx);
                 return 1;
             }
 
@@ -645,7 +651,7 @@ int main(int argc, char *argv[]) {
                 free(noise);
                 free(text_emb);
                 fclose(noise_file);
-                flux_free(ctx);
+                iris_free(ctx);
                 return 1;
             }
             fclose(noise_file);
@@ -654,20 +660,20 @@ int main(int argc, char *argv[]) {
 
         /* Generate */
         if (noise) {
-            output = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
+            output = iris_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
                                                               noise, noise_size, &params);
             free(noise);
         } else {
-            output = flux_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+            output = iris_generate_with_embeddings(ctx, text_emb, text_seq, &params);
         }
         free(text_emb);
 
     } else {
         /* ============== Text-to-image mode ============== */
-        /* Note: flux_generate handles text encoding internally.
+        /* Note: iris_generate handles text encoding internally.
          * We can't easily time it separately without modifying the library.
          * The progress callbacks will show denoising progress. */
-        output = flux_generate(ctx, prompt, &params);
+        output = iris_generate(ctx, prompt, &params);
     }
 
     /* Finish progress display */
@@ -675,12 +681,12 @@ int main(int argc, char *argv[]) {
 
     /* Clear step image callback if it was set */
     if (show_steps) {
-        flux_set_step_image_callback(ctx, NULL);
+        iris_set_step_image_callback(ctx, NULL);
     }
 
     if (!output) {
-        fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
-        flux_free(ctx);
+        fprintf(stderr, "Error: Generation failed: %s\n", iris_get_error());
+        iris_free(ctx);
         return 1;
     }
 
@@ -697,10 +703,10 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    if (flux_image_save_with_seed(output, output_path, actual_seed) != 0) {
+    if (iris_image_save_with_seed(output, output_path, actual_seed) != 0) {
         fprintf(stderr, "\nError: Failed to save image: %s\n", output_path);
-        flux_image_free(output);
-        flux_free(ctx);
+        iris_image_free(output);
+        iris_free(ctx);
         return 1;
     }
 
@@ -719,11 +725,11 @@ int main(int argc, char *argv[]) {
     LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
 
     /* Cleanup */
-    flux_image_free(output);
-    flux_free(ctx);
+    iris_image_free(output);
+    iris_free(ctx);
 
 #ifdef USE_METAL
-    flux_metal_cleanup();
+    iris_metal_cleanup();
 #endif
 
     return 0;

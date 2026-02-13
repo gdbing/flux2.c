@@ -1,12 +1,12 @@
 /*
- * Qwen3 Text Encoder for FLUX.2-klein
+ * Qwen3 Text Encoder for Iris
  *
- * Implements the Qwen3 text encoder that produces embeddings for FLUX image
+ * Implements the Qwen3 text encoder that produces embeddings for image
  * generation. Supports multiple model sizes (architecture read from config.json).
  */
 
-#ifndef FLUX_QWEN3_H
-#define FLUX_QWEN3_H
+#ifndef IRIS_QWEN3_H
+#define IRIS_QWEN3_H
 
 #include <stdint.h>
 
@@ -154,4 +154,4 @@ float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
 }
 #endif
 
-#endif /* FLUX_QWEN3_H */
+#endif /* IRIS_QWEN3_H */
