@@ -5214,6 +5214,40 @@ static const safetensor_t *find_lora_tensor(const safetensors_file_t *sf,
     return NULL;
 }
 
+/* Find a LoRA pair using either:
+ * - lora_A/lora_B
+ * - lora_down/lora_up (common in kohya/Comfy exports) */
+static int find_lora_pair(const safetensors_file_t *sf,
+                          const char *module,
+                          const safetensor_t **tA,
+                          const safetensor_t **tB,
+                          char *keyA,
+                          size_t keyA_cap,
+                          char *keyB,
+                          size_t keyB_cap) {
+    *tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, keyA_cap);
+    *tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, keyB_cap);
+    if (*tA || *tB) {
+        if (!*tA || !*tB) {
+            fprintf(stderr, "LoRA pair incomplete for module %s (expected lora_A/lora_B)\n", module);
+            return -1;
+        }
+        return 1;
+    }
+
+    *tA = find_lora_tensor(sf, module, "lora_down.weight", keyA, keyA_cap);
+    *tB = find_lora_tensor(sf, module, "lora_up.weight", keyB, keyB_cap);
+    if (*tA || *tB) {
+        if (!*tA || !*tB) {
+            fprintf(stderr, "LoRA pair incomplete for module %s (expected lora_down/lora_up)\n", module);
+            return -1;
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
 static int lora_validate_matrix(const safetensor_t *t,
                                 int rows, int cols,
                                 const char *name) {
@@ -5269,15 +5303,12 @@ static int apply_lora_matrix(const safetensors_file_t *sf,
     const safetensor_t *tA, *tB;
     float *A = NULL, *B = NULL;
     int rank;
+    int pair_state;
     char keyA[512], keyB[512];
 
-    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
-    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
-    if (!tA && !tB) return 0;  /* Module not present in this LoRA. */
-    if (!tA || !tB) {
-        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
-        return -1;
-    }
+    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    if (pair_state == 0) return 0;   /* Module not present in this LoRA. */
+    if (pair_state < 0) return -1;
 
     rank = (int)tA->shape[0];
     if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
@@ -5312,15 +5343,12 @@ static int apply_lora_split_linear_in(const safetensors_file_t *sf,
     float *A = NULL, *B = NULL;
     int rank;
     int out_total = mlp_hidden * 2;
+    int pair_state;
     char keyA[512], keyB[512];
 
-    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
-    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
-    if (!tA && !tB) return 0;
-    if (!tA || !tB) {
-        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
-        return -1;
-    }
+    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    if (pair_state == 0) return 0;
+    if (pair_state < 0) return -1;
 
     rank = (int)tA->shape[0];
     if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
@@ -5357,15 +5385,12 @@ static int apply_lora_split_qkv(const safetensors_file_t *sf,
     float *A = NULL, *B = NULL;
     int rank;
     int out_total = hidden * 3;
+    int pair_state;
     char keyA[512], keyB[512];
 
-    tA = find_lora_tensor(sf, module, "lora_A.weight", keyA, sizeof(keyA));
-    tB = find_lora_tensor(sf, module, "lora_B.weight", keyB, sizeof(keyB));
-    if (!tA && !tB) return 0;
-    if (!tA || !tB) {
-        fprintf(stderr, "LoRA pair incomplete for module %s\n", module);
-        return -1;
-    }
+    pair_state = find_lora_pair(sf, module, &tA, &tB, keyA, sizeof(keyA), keyB, sizeof(keyB));
+    if (pair_state == 0) return 0;
+    if (pair_state < 0) return -1;
 
     rank = (int)tA->shape[0];
     if (lora_validate_matrix(tA, rank, in_dim, keyA) != 0) return -1;
