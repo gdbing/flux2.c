@@ -30,10 +30,10 @@ extern "C" {
  * ======================================================================== */
 
 /* Model architecture constants (same across model sizes) */
-#define FLUX_LATENT_CHANNELS    128
+#define FLUX_LATENT_CHANNELS    128  /* Flux: 32*2*2, Z-Image: 16*2*2=64 */
 
 /* VAE architecture */
-#define FLUX_VAE_Z_CHANNELS     32
+#define FLUX_VAE_Z_CHANNELS     32   /* Flux default; Z-Image uses 16 */
 #define FLUX_VAE_BASE_CH        128
 #define FLUX_VAE_CH_MULT_0      1
 #define FLUX_VAE_CH_MULT_1      2
@@ -125,6 +125,12 @@ void flux_set_mmap(flux_ctx *ctx, int enable);
  * Returns 1 for distilled, 0 for base.
  */
 int flux_is_distilled(flux_ctx *ctx);
+
+/*
+ * Check if model is Z-Image (S3-DiT architecture).
+ * Returns 1 for Z-Image, 0 for Flux.
+ */
+int flux_is_zimage(flux_ctx *ctx);
 
 /*
  * Force base model mode (overrides autodetection).
