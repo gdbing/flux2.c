@@ -205,6 +205,18 @@ typedef struct {
     uint16_t *proj_mlp_weight_bf16; /* [hidden, hidden + mlp_hidden] (bf16) */
 } single_block_t;
 
+/* Optional sidecar storage for mmap+LoRA:
+ * stores merged f32 block weights so we avoid per-step re-merge work. */
+typedef struct {
+    double_block_t block;
+    int valid;
+} lora_double_sidecar_t;
+
+typedef struct {
+    single_block_t block;
+    int valid;
+} lora_single_sidecar_t;
+
 /* Timestep embedding MLP
  * FLUX.2-klein uses 256-dim sinusoidal embedding (128 frequencies)
  * linear_1: [hidden, 256] - projects sinusoidal to hidden
@@ -336,6 +348,10 @@ typedef struct flux_transformer {
     /* Optional LoRA adapter state for mmap mode (lazy per-block merge). */
     safetensors_file_t *lora_sf;
     float lora_scale;
+    lora_double_sidecar_t *lora_double_sidecars;
+    lora_single_sidecar_t *lora_single_sidecars;
+    uint8_t *double_block_from_sidecar;
+    uint8_t *single_block_from_sidecar;
 } flux_transformer_t;
 
 /* ========================================================================
@@ -509,6 +525,11 @@ static int apply_lora_double_block_module(const safetensors_file_t *sf, int idx,
 static int apply_lora_single_block_module(const safetensors_file_t *sf, int idx,
                                           single_block_t *b, int h, int mlp,
                                           float scale, int *modules_applied);
+static void clear_lora_sidecar_cache(flux_transformer_t *tf);
+static void prepare_double_block_for_forward(flux_transformer_t *tf, int idx);
+static void prepare_single_block_for_forward(flux_transformer_t *tf, int idx);
+static void release_double_block_after_forward(flux_transformer_t *tf, int idx);
+static void release_single_block_after_forward(flux_transformer_t *tf, int idx);
 
 /* ========================================================================
  * Mmap mode: on-demand weight loading/freeing for blocks
@@ -716,14 +737,213 @@ static void free_single_block_weights(single_block_t *b) {
     b->proj_mlp_weight_bf16 = NULL;
 }
 
+static void clear_double_block_weight_ptrs(double_block_t *b) {
+    if (!b) return;
+    memset(b, 0, sizeof(*b));
+}
+
+static void clear_single_block_weight_ptrs(single_block_t *b) {
+    if (!b) return;
+    memset(b, 0, sizeof(*b));
+}
+
+static int use_mmap_lora_sidecar(const flux_transformer_t *tf) {
+    return tf && tf->use_mmap && tf->lora_sf && !tf->use_bf16;
+}
+
+static void clear_lora_sidecar_cache(flux_transformer_t *tf) {
+    if (!tf) return;
+
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        if (tf->lora_double_sidecars && tf->lora_double_sidecars[i].valid) {
+            free_double_block_weights(&tf->lora_double_sidecars[i].block);
+            tf->lora_double_sidecars[i].valid = 0;
+        }
+        if (tf->double_block_from_sidecar && tf->double_block_from_sidecar[i]) {
+            clear_double_block_weight_ptrs(&tf->double_blocks[i]);
+            tf->double_block_from_sidecar[i] = 0;
+        }
+    }
+
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        if (tf->lora_single_sidecars && tf->lora_single_sidecars[i].valid) {
+            free_single_block_weights(&tf->lora_single_sidecars[i].block);
+            tf->lora_single_sidecars[i].valid = 0;
+        }
+        if (tf->single_block_from_sidecar && tf->single_block_from_sidecar[i]) {
+            clear_single_block_weight_ptrs(&tf->single_blocks[i]);
+            tf->single_block_from_sidecar[i] = 0;
+        }
+    }
+}
+
+static void disable_mmap_lora(flux_transformer_t *tf,
+                              const char *block_kind,
+                              int idx) {
+    if (!tf || !tf->lora_sf) return;
+    fprintf(stderr, "Disabling mmap LoRA after %s block %d merge failure\n", block_kind, idx);
+    safetensors_close(tf->lora_sf);
+    tf->lora_sf = NULL;
+    tf->lora_scale = 0.0f;
+    clear_lora_sidecar_cache(tf);
+}
+
+static void prepare_double_block_for_forward(flux_transformer_t *tf, int idx) {
+    double_block_t *runtime;
+    lora_double_sidecar_t *sidecar;
+
+    if (!tf || !tf->use_mmap) return;
+    runtime = &tf->double_blocks[idx];
+
+    if (!use_mmap_lora_sidecar(tf)) {
+        if (runtime->img_q_weight == NULL && runtime->img_q_weight_bf16 == NULL) {
+            load_double_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        if (tf->double_block_from_sidecar) tf->double_block_from_sidecar[idx] = 0;
+        return;
+    }
+
+    if (!tf->lora_double_sidecars || !tf->double_block_from_sidecar) {
+        if (runtime->img_q_weight == NULL && runtime->img_q_weight_bf16 == NULL) {
+            load_double_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        if (apply_lora_double_block_module(tf->lora_sf, idx, runtime,
+                                           tf->hidden_size, tf->mlp_hidden,
+                                           tf->lora_scale, NULL) != 0) {
+            disable_mmap_lora(tf, "double", idx);
+        }
+        return;
+    }
+    sidecar = &tf->lora_double_sidecars[idx];
+    if (sidecar->valid) {
+        *runtime = sidecar->block;
+        tf->double_block_from_sidecar[idx] = 1;
+        return;
+    }
+
+    if (runtime->img_q_weight == NULL && runtime->img_q_weight_bf16 == NULL) {
+        load_double_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                  tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+    }
+    if (apply_lora_double_block_module(tf->lora_sf, idx, runtime,
+                                       tf->hidden_size, tf->mlp_hidden,
+                                       tf->lora_scale, NULL) != 0) {
+        disable_mmap_lora(tf, "double", idx);
+        tf->double_block_from_sidecar[idx] = 0;
+        return;
+    }
+
+    sidecar->block = *runtime;
+    sidecar->valid = 1;
+    clear_double_block_weight_ptrs(runtime);
+    *runtime = sidecar->block;
+    tf->double_block_from_sidecar[idx] = 1;
+}
+
+static void prepare_single_block_for_forward(flux_transformer_t *tf, int idx) {
+    single_block_t *runtime;
+    lora_single_sidecar_t *sidecar;
+
+    if (!tf || !tf->use_mmap) return;
+    runtime = &tf->single_blocks[idx];
+
+    if (!use_mmap_lora_sidecar(tf)) {
+        if (runtime->qkv_mlp_weight == NULL && runtime->qkv_mlp_weight_bf16 == NULL) {
+            load_single_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        if (tf->single_block_from_sidecar) tf->single_block_from_sidecar[idx] = 0;
+        return;
+    }
+
+    if (!tf->lora_single_sidecars || !tf->single_block_from_sidecar) {
+        if (runtime->qkv_mlp_weight == NULL && runtime->qkv_mlp_weight_bf16 == NULL) {
+            load_single_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        if (apply_lora_single_block_module(tf->lora_sf, idx, runtime,
+                                           tf->hidden_size, tf->mlp_hidden,
+                                           tf->lora_scale, NULL) != 0) {
+            disable_mmap_lora(tf, "single", idx);
+        }
+        return;
+    }
+    sidecar = &tf->lora_single_sidecars[idx];
+    if (sidecar->valid) {
+        *runtime = sidecar->block;
+        tf->single_block_from_sidecar[idx] = 1;
+        return;
+    }
+
+    if (runtime->qkv_mlp_weight == NULL && runtime->qkv_mlp_weight_bf16 == NULL) {
+        load_single_block_weights(runtime, tf->sf_files, tf->num_sf_files, idx,
+                                  tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+    }
+    if (apply_lora_single_block_module(tf->lora_sf, idx, runtime,
+                                       tf->hidden_size, tf->mlp_hidden,
+                                       tf->lora_scale, NULL) != 0) {
+        disable_mmap_lora(tf, "single", idx);
+        tf->single_block_from_sidecar[idx] = 0;
+        return;
+    }
+
+    sidecar->block = *runtime;
+    sidecar->valid = 1;
+    clear_single_block_weight_ptrs(runtime);
+    *runtime = sidecar->block;
+    tf->single_block_from_sidecar[idx] = 1;
+}
+
+static void release_double_block_after_forward(flux_transformer_t *tf, int idx) {
+    if (!tf || !tf->use_mmap) return;
+    if (tf->double_block_from_sidecar && tf->double_block_from_sidecar[idx]) {
+        clear_double_block_weight_ptrs(&tf->double_blocks[idx]);
+        tf->double_block_from_sidecar[idx] = 0;
+        return;
+    }
+    free_double_block_weights(&tf->double_blocks[idx]);
+}
+
+static void release_single_block_after_forward(flux_transformer_t *tf, int idx) {
+    if (!tf || !tf->use_mmap) return;
+    if (tf->single_block_from_sidecar && tf->single_block_from_sidecar[idx]) {
+        clear_single_block_weight_ptrs(&tf->single_blocks[idx]);
+        tf->single_block_from_sidecar[idx] = 0;
+        return;
+    }
+    free_single_block_weights(&tf->single_blocks[idx]);
+}
+
 /* Free cached mmap weights for all blocks.
  * Called after denoising completes to release memory held across steps. */
 void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
     if (!tf || !tf->use_mmap) return;
-    for (int i = 0; i < tf->num_double_layers; i++)
-        free_double_block_weights(&tf->double_blocks[i]);
-    for (int i = 0; i < tf->num_single_layers; i++)
-        free_single_block_weights(&tf->single_blocks[i]);
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        if (tf->double_block_from_sidecar && tf->double_block_from_sidecar[i]) {
+            clear_double_block_weight_ptrs(&tf->double_blocks[i]);
+            tf->double_block_from_sidecar[i] = 0;
+        } else {
+            free_double_block_weights(&tf->double_blocks[i]);
+        }
+        if (tf->lora_double_sidecars && tf->lora_double_sidecars[i].valid) {
+            free_double_block_weights(&tf->lora_double_sidecars[i].block);
+            tf->lora_double_sidecars[i].valid = 0;
+        }
+    }
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        if (tf->single_block_from_sidecar && tf->single_block_from_sidecar[i]) {
+            clear_single_block_weight_ptrs(&tf->single_blocks[i]);
+            tf->single_block_from_sidecar[i] = 0;
+        } else {
+            free_single_block_weights(&tf->single_blocks[i]);
+        }
+        if (tf->lora_single_sidecars && tf->lora_single_sidecars[i].valid) {
+            free_single_block_weights(&tf->lora_single_sidecars[i].block);
+            tf->lora_single_sidecars[i].valid = 0;
+        }
+    }
 }
 
 #ifdef USE_METAL
@@ -3612,21 +3832,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                        1, hidden, double_mod_size);
 
     for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand and free after use */
-        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
-                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-            if (tf->lora_sf && !tf->use_bf16) {
-                if (apply_lora_double_block_module(tf->lora_sf, i, &tf->double_blocks[i],
-                                                   tf->hidden_size, tf->mlp_hidden,
-                                                   tf->lora_scale, NULL) != 0) {
-                    fprintf(stderr, "Disabling mmap LoRA after double block %d merge failure\n", i);
-                    safetensors_close(tf->lora_sf);
-                    tf->lora_sf = NULL;
-                    tf->lora_scale = 0.0f;
-                }
-            }
+        /* In mmap mode, load weights on-demand and optionally attach sidecar merges. */
+        if (tf->use_mmap) {
+            prepare_double_block_for_forward(tf, i);
         }
         double_block_forward(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
@@ -3634,7 +3842,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
-        if (tf->use_mmap) free_double_block_weights(&tf->double_blocks[i]);
+        if (tf->use_mmap) release_double_block_after_forward(tf, i);
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
@@ -3844,21 +4052,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
-            /* In mmap mode, load block weights on-demand and free after use */
-            if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
-                             && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
-                load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                          tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-                if (tf->lora_sf && !tf->use_bf16) {
-                    if (apply_lora_single_block_module(tf->lora_sf, i, &tf->single_blocks[i],
-                                                       tf->hidden_size, tf->mlp_hidden,
-                                                       tf->lora_scale, NULL) != 0) {
-                        fprintf(stderr, "Disabling mmap LoRA after single block %d merge failure\n", i);
-                        safetensors_close(tf->lora_sf);
-                        tf->lora_sf = NULL;
-                        tf->lora_scale = 0.0f;
-                    }
-                }
+            /* In mmap mode, load weights on-demand and optionally attach sidecar merges. */
+            if (tf->use_mmap) {
+                prepare_single_block_for_forward(tf, i);
             }
 #ifdef USE_METAL
             /* Try GPU-optimized path first */
@@ -3876,7 +4072,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                      txt_rope_cos, txt_rope_sin,
                                      total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
             }
-            if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+            if (tf->use_mmap) release_single_block_after_forward(tf, i);
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -4101,18 +4297,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Double blocks - process combined image with text */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-            if (tf->lora_sf && !tf->use_bf16) {
-                if (apply_lora_double_block_module(tf->lora_sf, i, &tf->double_blocks[i],
-                                                   tf->hidden_size, tf->mlp_hidden,
-                                                   tf->lora_scale, NULL) != 0) {
-                    fprintf(stderr, "Disabling mmap LoRA after double block %d merge failure\n", i);
-                    safetensors_close(tf->lora_sf);
-                    tf->lora_sf = NULL;
-                    tf->lora_scale = 0.0f;
-                }
-            }
+            prepare_double_block_for_forward(tf, i);
         }
         double_block_forward(combined_hidden, txt_hidden,
                              &tf->double_blocks[i],
@@ -4121,7 +4306,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              txt_rope_cos, txt_rope_sin,
                              combined_img_seq, txt_seq, tf);
         if (tf->use_mmap) {
-            free_double_block_weights(&tf->double_blocks[i]);
+            release_double_block_after_forward(tf, i);
             /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
@@ -4137,18 +4322,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-            if (tf->lora_sf && !tf->use_bf16) {
-                if (apply_lora_single_block_module(tf->lora_sf, i, &tf->single_blocks[i],
-                                                   tf->hidden_size, tf->mlp_hidden,
-                                                   tf->lora_scale, NULL) != 0) {
-                    fprintf(stderr, "Disabling mmap LoRA after single block %d merge failure\n", i);
-                    safetensors_close(tf->lora_sf);
-                    tf->lora_sf = NULL;
-                    tf->lora_scale = 0.0f;
-                }
-            }
+            prepare_single_block_for_forward(tf, i);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
                              t_emb, tf->adaln_single_weight,
@@ -4156,7 +4330,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                              txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);
         if (tf->use_mmap) {
-            free_single_block_weights(&tf->single_blocks[i]);
+            release_single_block_after_forward(tf, i);
             /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
@@ -4365,18 +4539,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Double blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
-            load_double_block_weights(&tf->double_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-            if (tf->lora_sf && !tf->use_bf16) {
-                if (apply_lora_double_block_module(tf->lora_sf, i, &tf->double_blocks[i],
-                                                   tf->hidden_size, tf->mlp_hidden,
-                                                   tf->lora_scale, NULL) != 0) {
-                    fprintf(stderr, "Disabling mmap LoRA after double block %d merge failure\n", i);
-                    safetensors_close(tf->lora_sf);
-                    tf->lora_sf = NULL;
-                    tf->lora_scale = 0.0f;
-                }
-            }
+            prepare_double_block_for_forward(tf, i);
         }
         double_block_forward(combined_hidden, txt_hidden,
                              &tf->double_blocks[i],
@@ -4385,7 +4548,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              txt_rope_cos, txt_rope_sin,
                              combined_img_seq, txt_seq, tf);
         if (tf->use_mmap) {
-            free_double_block_weights(&tf->double_blocks[i]);
+            release_double_block_after_forward(tf, i);
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
@@ -4400,18 +4563,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
-            load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
-                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
-            if (tf->lora_sf && !tf->use_bf16) {
-                if (apply_lora_single_block_module(tf->lora_sf, i, &tf->single_blocks[i],
-                                                   tf->hidden_size, tf->mlp_hidden,
-                                                   tf->lora_scale, NULL) != 0) {
-                    fprintf(stderr, "Disabling mmap LoRA after single block %d merge failure\n", i);
-                    safetensors_close(tf->lora_sf);
-                    tf->lora_sf = NULL;
-                    tf->lora_scale = 0.0f;
-                }
-            }
+            prepare_single_block_for_forward(tf, i);
         }
         single_block_forward(concat_hidden, &tf->single_blocks[i],
                              t_emb, tf->adaln_single_weight,
@@ -4419,7 +4571,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                              txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);
         if (tf->use_mmap) {
-            free_single_block_weights(&tf->single_blocks[i]);
+            release_single_block_after_forward(tf, i);
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
@@ -4690,6 +4842,10 @@ void flux_transformer_free(flux_transformer_t *tf) {
         }
         free(tf->single_blocks);
     }
+    free(tf->lora_double_sidecars);
+    free(tf->lora_single_sidecars);
+    free(tf->double_block_from_sidecar);
+    free(tf->single_block_from_sidecar);
 
     free(tf->final_norm_weight);
     free(tf->final_proj_weight);
@@ -5188,6 +5344,16 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(const char *model_dir
     /* Allocate empty block arrays - weights loaded on-demand */
     tf->double_blocks = calloc(tf->num_double_layers, sizeof(double_block_t));
     tf->single_blocks = calloc(tf->num_single_layers, sizeof(single_block_t));
+    tf->lora_double_sidecars = calloc(tf->num_double_layers, sizeof(lora_double_sidecar_t));
+    tf->lora_single_sidecars = calloc(tf->num_single_layers, sizeof(lora_single_sidecar_t));
+    tf->double_block_from_sidecar = calloc(tf->num_double_layers, sizeof(uint8_t));
+    tf->single_block_from_sidecar = calloc(tf->num_single_layers, sizeof(uint8_t));
+    if (!tf->double_blocks || !tf->single_blocks ||
+        !tf->lora_double_sidecars || !tf->lora_single_sidecars ||
+        !tf->double_block_from_sidecar || !tf->single_block_from_sidecar) {
+        flux_transformer_free(tf);
+        return NULL;
+    }
 
     /* Final layer - always load (small) */
     tf->final_norm_weight = get_sf_tensor_tf(files, num_files, "norm_out.linear.weight");
@@ -5853,6 +6019,8 @@ int flux_transformer_apply_lora(flux_transformer_t *tf,
     if (apply_lora_matrix(sf, "proj_out", tf->final_proj_weight, latent, h, scale, &stats) != 0) goto error;
 
     if (tf->use_mmap) {
+        /* Drop any previous cached block weights before switching adapters. */
+        flux_transformer_free_mmap_cache(tf);
         if (tf->lora_sf) safetensors_close(tf->lora_sf);
         tf->lora_sf = sf;
         tf->lora_scale = scale;
