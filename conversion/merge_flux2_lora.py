@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""
+Merge a FLUX LoRA into a copied Diffusers transformer directory.
+
+This script ports the key-matching behavior from flux2.c's C LoRA loader:
+- Suffix-based module matching with unknown key roots.
+- Support for both lora_A/lora_B and lora_down/lora_up naming.
+- Fallback aliases for non-standard FLUX LoRA module names.
+- Fallback split for combined qkv adapters used by some trainers.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from diffusers import Flux2Transformer2DModel
+from safetensors.torch import load_file
+
+
+@dataclass(frozen=True)
+class LoraCandidate:
+    key: str
+    root: str
+    tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class LoraPair:
+    key_a: str
+    key_b: str
+    a: torch.Tensor
+    b: torch.Tensor
+
+
+@dataclass
+class MergeStats:
+    modules_applied: int = 0
+    source_tensors_used: int = 0
+    source_tensors_total: int = 0
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Fuse a LoRA into a FLUX transformer and save merged weights."
+    )
+    p.add_argument(
+        "--model-dir",
+        type=Path,
+        required=True,
+        help="Path to model root (contains transformer/) or transformer directory directly.",
+    )
+    p.add_argument("--lora", type=Path, required=True, help="Path to LoRA .safetensors file")
+    p.add_argument("--out", type=Path, required=True, help="Output merged transformer directory")
+    p.add_argument("--lora-scale", type=float, default=1.0, help="LoRA scale for fusion")
+    p.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default="bfloat16",
+        help="Dtype used to load, fuse, and save transformer weights",
+    )
+    p.add_argument(
+        "--max-shard-size",
+        default="10GB",
+        help="Max shard size passed to save_pretrained (default: 10GB)",
+    )
+    return p.parse_args()
+
+
+def resolve_transformer_dir(path: Path) -> Path:
+    path = path.resolve()
+    if (path / "config.json").exists():
+        return path
+    candidate = path / "transformer"
+    if (candidate / "config.json").exists():
+        return candidate
+    raise FileNotFoundError(f"Could not find transformer/config.json under: {path}")
+
+
+def dtype_from_name(name: str) -> torch.dtype:
+    if name == "float32":
+        return torch.float32
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {name}")
+
+
+def collect_lora_candidates(
+    state_dict: dict[str, torch.Tensor],
+    module: str,
+    suffixes: tuple[str, ...],
+) -> list[LoraCandidate]:
+    cands: list[LoraCandidate] = []
+    for key, tensor in state_dict.items():
+        for suffix in suffixes:
+            target = f"{module}.{suffix}"
+            if not key.endswith(target):
+                continue
+            root = key[: -len(target)]
+            if root and not root.endswith("."):
+                continue
+            cands.append(LoraCandidate(key=key, root=root, tensor=tensor))
+            break
+    return cands
+
+
+def resolve_lora_pair(
+    module: str,
+    format_label: str,
+    cands_a: list[LoraCandidate],
+    cands_b: list[LoraCandidate],
+) -> LoraPair | None:
+    if not cands_a and not cands_b:
+        return None
+    if not cands_a or not cands_b:
+        raise ValueError(
+            f"LoRA pair incomplete for module {module} (expected {format_label})"
+        )
+
+    matches: list[tuple[LoraCandidate, LoraCandidate]] = []
+    for a in cands_a:
+        for b in cands_b:
+            if a.root == b.root:
+                matches.append((a, b))
+
+    if len(matches) == 1:
+        a, b = matches[0]
+        return LoraPair(key_a=a.key, key_b=b.key, a=a.tensor, b=b.tensor)
+
+    bare = [m for m in matches if m[0].root == "" and m[1].root == ""]
+    if len(matches) > 1 and len(bare) == 1:
+        a, b = bare[0]
+        return LoraPair(key_a=a.key, key_b=b.key, a=a.tensor, b=b.tensor)
+
+    if not matches:
+        raise ValueError(f"LoRA roots mismatch for module {module} ({format_label})")
+    raise ValueError(f"LoRA pair ambiguous for module {module} ({format_label})")
+
+
+def find_lora_pair(
+    state_dict: dict[str, torch.Tensor],
+    module: str,
+) -> LoraPair | None:
+    cands_a = collect_lora_candidates(
+        state_dict, module, ("lora_A.weight", "lora_A.default.weight")
+    )
+    cands_b = collect_lora_candidates(
+        state_dict, module, ("lora_B.weight", "lora_B.default.weight")
+    )
+    pair = resolve_lora_pair(module, "lora_A/lora_B", cands_a, cands_b)
+    if pair is not None:
+        return pair
+
+    cands_a = collect_lora_candidates(
+        state_dict, module, ("lora_down.weight", "lora_down.default.weight")
+    )
+    cands_b = collect_lora_candidates(
+        state_dict, module, ("lora_up.weight", "lora_up.default.weight")
+    )
+    return resolve_lora_pair(module, "lora_down/lora_up", cands_a, cands_b)
+
+
+def validate_pair_shapes(pair: LoraPair, module: str) -> None:
+    if pair.a.ndim != 2 or pair.b.ndim != 2:
+        raise ValueError(
+            f"LoRA tensors for {module} must be rank-2, got A={tuple(pair.a.shape)} B={tuple(pair.b.shape)}"
+        )
+    if pair.b.shape[1] != pair.a.shape[0]:
+        raise ValueError(
+            f"LoRA rank mismatch for {module}: A={tuple(pair.a.shape)} B={tuple(pair.b.shape)}"
+        )
+
+
+def normalize_lora_state_dict(
+    raw: dict[str, torch.Tensor],
+    num_double_layers: int,
+    num_single_layers: int,
+) -> tuple[dict[str, torch.Tensor], MergeStats]:
+    out: dict[str, torch.Tensor] = {}
+    used_keys: set[str] = set()
+    stats = MergeStats(source_tensors_total=len(raw))
+
+    def add_pair(dest_module: str, pair: LoraPair) -> None:
+        validate_pair_shapes(pair, dest_module)
+        key_a = f"transformer.{dest_module}.lora_A.weight"
+        key_b = f"transformer.{dest_module}.lora_B.weight"
+        if key_a in out or key_b in out:
+            raise ValueError(f"Duplicate normalized LoRA destination for module {dest_module}")
+        out[key_a] = pair.a.contiguous()
+        out[key_b] = pair.b.contiguous()
+        used_keys.add(pair.key_a)
+        used_keys.add(pair.key_b)
+        stats.modules_applied += 1
+
+    def add_from_source(dest_module: str, source_module: str) -> bool:
+        pair = find_lora_pair(raw, source_module)
+        if pair is None:
+            return False
+        add_pair(dest_module, pair)
+        return True
+
+    def add_qkv_fallback(source_module: str, dest_modules: tuple[str, str, str]) -> bool:
+        pair = find_lora_pair(raw, source_module)
+        if pair is None:
+            return False
+        validate_pair_shapes(pair, source_module)
+        out_rows = int(pair.b.shape[0])
+        if out_rows % 3 != 0:
+            raise ValueError(
+                f"Expected LoRA B rows divisible by 3 for {source_module}, got {tuple(pair.b.shape)}"
+            )
+        split = out_rows // 3
+        for i, dest in enumerate(dest_modules):
+            part = pair.b[i * split : (i + 1) * split, :].contiguous()
+            add_pair(
+                dest,
+                LoraPair(
+                    key_a=pair.key_a,
+                    key_b=pair.key_b,
+                    a=pair.a.contiguous(),
+                    b=part,
+                ),
+            )
+        return True
+
+    # Shared modules.
+    for module in (
+        "x_embedder",
+        "context_embedder",
+        "double_stream_modulation_img.linear",
+        "double_stream_modulation_txt.linear",
+        "single_stream_modulation.linear",
+        "proj_out",
+    ):
+        add_from_source(module, module)
+
+    # Double-stream blocks with fallback aliases.
+    for i in range(num_double_layers):
+        q = add_from_source(
+            f"transformer_blocks.{i}.attn.to_q",
+            f"transformer_blocks.{i}.attn.to_q",
+        )
+        k = add_from_source(
+            f"transformer_blocks.{i}.attn.to_k",
+            f"transformer_blocks.{i}.attn.to_k",
+        )
+        v = add_from_source(
+            f"transformer_blocks.{i}.attn.to_v",
+            f"transformer_blocks.{i}.attn.to_v",
+        )
+        if not (q or k or v):
+            add_qkv_fallback(
+                f"double_blocks.{i}.img_attn.qkv",
+                (
+                    f"transformer_blocks.{i}.attn.to_q",
+                    f"transformer_blocks.{i}.attn.to_k",
+                    f"transformer_blocks.{i}.attn.to_v",
+                ),
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.attn.to_out.0",
+            f"transformer_blocks.{i}.attn.to_out.0",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.attn.to_out.0",
+                f"double_blocks.{i}.img_attn.proj",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff.linear_in",
+            f"transformer_blocks.{i}.ff.linear_in",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff.linear_in",
+                f"double_blocks.{i}.img_mlp.0",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff.linear_out",
+            f"transformer_blocks.{i}.ff.linear_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff.linear_out",
+                f"double_blocks.{i}.img_mlp.2",
+            )
+
+        q = add_from_source(
+            f"transformer_blocks.{i}.attn.add_q_proj",
+            f"transformer_blocks.{i}.attn.add_q_proj",
+        )
+        k = add_from_source(
+            f"transformer_blocks.{i}.attn.add_k_proj",
+            f"transformer_blocks.{i}.attn.add_k_proj",
+        )
+        v = add_from_source(
+            f"transformer_blocks.{i}.attn.add_v_proj",
+            f"transformer_blocks.{i}.attn.add_v_proj",
+        )
+        if not (q or k or v):
+            add_qkv_fallback(
+                f"double_blocks.{i}.txt_attn.qkv",
+                (
+                    f"transformer_blocks.{i}.attn.add_q_proj",
+                    f"transformer_blocks.{i}.attn.add_k_proj",
+                    f"transformer_blocks.{i}.attn.add_v_proj",
+                ),
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.attn.to_add_out",
+            f"transformer_blocks.{i}.attn.to_add_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.attn.to_add_out",
+                f"double_blocks.{i}.txt_attn.proj",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff_context.linear_in",
+            f"transformer_blocks.{i}.ff_context.linear_in",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff_context.linear_in",
+                f"double_blocks.{i}.txt_mlp.0",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff_context.linear_out",
+            f"transformer_blocks.{i}.ff_context.linear_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff_context.linear_out",
+                f"double_blocks.{i}.txt_mlp.2",
+            )
+
+    # Single-stream blocks with fallback aliases.
+    for i in range(num_single_layers):
+        if not add_from_source(
+            f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+            f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+        ):
+            add_from_source(
+                f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+                f"single_blocks.{i}.linear1",
+            )
+
+        if not add_from_source(
+            f"single_transformer_blocks.{i}.attn.to_out",
+            f"single_transformer_blocks.{i}.attn.to_out",
+        ):
+            add_from_source(
+                f"single_transformer_blocks.{i}.attn.to_out",
+                f"single_blocks.{i}.linear2",
+            )
+
+    stats.source_tensors_used = len(used_keys)
+    return out, stats
+
+
+def merge_lora_into_transformer(
+    model: Flux2Transformer2DModel,
+    normalized_lora: dict[str, torch.Tensor],
+    scale: float,
+) -> int:
+    params = dict(model.named_parameters())
+    modules: list[str] = []
+    prefix = "transformer."
+    suffix_a = ".lora_A.weight"
+    suffix_b = ".lora_B.weight"
+
+    for key in normalized_lora.keys():
+        if key.startswith(prefix) and key.endswith(suffix_a):
+            modules.append(key[len(prefix) : -len(suffix_a)])
+
+    merged_modules = 0
+    with torch.no_grad():
+        for module in sorted(modules):
+            key_a = f"{prefix}{module}{suffix_a}"
+            key_b = f"{prefix}{module}{suffix_b}"
+            if key_b not in normalized_lora:
+                raise ValueError(f"Missing LoRA B tensor for module {module}")
+
+            a = normalized_lora[key_a].float()
+            b = normalized_lora[key_b].float()
+            if a.ndim != 2 or b.ndim != 2:
+                raise ValueError(
+                    f"LoRA tensors for {module} must be rank-2, got A={tuple(a.shape)} B={tuple(b.shape)}"
+                )
+            if b.shape[1] != a.shape[0]:
+                raise ValueError(
+                    f"LoRA rank mismatch for {module}: A={tuple(a.shape)} B={tuple(b.shape)}"
+                )
+
+            param_name = f"{module}.weight"
+            if param_name not in params:
+                raise ValueError(f"Transformer parameter not found for module {module} ({param_name})")
+
+            w = params[param_name]
+            expected = (int(b.shape[0]), int(a.shape[1]))
+            if tuple(w.shape) != expected:
+                raise ValueError(
+                    f"LoRA shape mismatch for {module}: got A={tuple(a.shape)} B={tuple(b.shape)}, "
+                    f"expected weight shape {tuple(w.shape)}"
+                )
+
+            merged = w.data.float()
+            merged.addmm_(b, a, beta=1.0, alpha=scale)
+            w.data.copy_(merged.to(dtype=w.dtype))
+            merged_modules += 1
+
+    return merged_modules
+
+
+def main() -> None:
+    args = parse_args()
+    model_dir = args.model_dir.resolve()
+    lora_path = args.lora.resolve()
+    out_dir = args.out.resolve()
+
+    if args.lora_scale <= 0:
+        raise ValueError("--lora-scale must be > 0")
+    if not lora_path.exists():
+        raise FileNotFoundError(f"LoRA file not found: {lora_path}")
+
+    transformer_dir = resolve_transformer_dir(model_dir)
+    dtype = dtype_from_name(args.dtype)
+
+    print(f"Transformer: {transformer_dir}")
+    print(f"LoRA:        {lora_path}")
+    print(f"Scale:       {args.lora_scale:.3f}")
+    print(f"DType:       {dtype}")
+
+    print("Loading transformer...")
+    model = Flux2Transformer2DModel.from_pretrained(
+        str(transformer_dir),
+        torch_dtype=dtype,
+        low_cpu_mem_usage=False,
+    )
+    num_double = len(model.transformer_blocks)
+    num_single = len(model.single_transformer_blocks)
+    print(f"Transformer blocks: double={num_double} single={num_single}")
+
+    print("Reading and normalizing LoRA keys...")
+    raw_lora = load_file(str(lora_path))
+    normalized_lora, stats = normalize_lora_state_dict(
+        raw_lora,
+        num_double_layers=num_double,
+        num_single_layers=num_single,
+    )
+
+    if not normalized_lora:
+        raise RuntimeError("LoRA applied to 0 modules (no matching keys found)")
+
+    print(
+        "Normalized LoRA: "
+        f"{len(normalized_lora)} tensors for {stats.modules_applied} modules "
+        f"(used {stats.source_tensors_used}/{stats.source_tensors_total} source tensors)"
+    )
+
+    print("Merging LoRA into transformer weights...")
+    merged_count = merge_lora_into_transformer(
+        model=model,
+        normalized_lora=normalized_lora,
+        scale=args.lora_scale,
+    )
+    print(f"Merged LoRA into {merged_count} transformer modules.")
+
+    print("Saving merged transformer...")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(
+        str(out_dir),
+        safe_serialization=True,
+        max_shard_size=args.max_shard_size,
+    )
+
+    print(f"Merged transformer saved to: {out_dir}")
+    print("Tip: run check_flux2c_keys.py on the output directory before swapping it into flux2.c.")
+
+
+if __name__ == "__main__":
+    main()

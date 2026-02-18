@@ -52,6 +52,28 @@ Exit codes:
 - `0`: required keys found
 - `2`: one or more required keys missing
 
+## Merge a LoRA into a copied transformer (offline bake)
+
+```bash
+uv run python merge_flux2_lora.py \
+  --model-dir /absolute/path/to/flux-klein-model \
+  --lora /absolute/path/to/lora.safetensors \
+  --out /absolute/path/to/merged/transformer \
+  --lora-scale 1.0
+```
+
+Notes:
+
+- `--model-dir` accepts either the model root (`.../transformer` inside) or the
+  transformer directory itself.
+- Output is a standalone Diffusers transformer folder that can replace the
+  original `transformer/` folder for `flux2.c`.
+- The merge script follows `flux2.c` LoRA key-matching behavior:
+  unknown key roots, `lora_A/B` and `lora_down/up`, and fallback aliases like
+  `double_blocks.*` and `single_blocks.*`.
+- For maximum merge precision use `--dtype float32`; for smaller output and
+  mmap-friendly runtime use `--dtype bfloat16` (default).
+
 ## Notes
 
 - This uses `diffusers` from GitHub (`main`) to ensure `Flux2Transformer2DModel`
