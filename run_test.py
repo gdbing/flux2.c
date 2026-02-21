@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FLUX test runner - verifies inference correctness against reference images.
-Usage: python3 run_test.py [--flux-binary PATH] [--full]
+Iris test runner - verifies inference correctness against reference images.
+Usage: python3 run_test.py [--binary PATH] [--full]
 """
 
 import argparse
@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -68,8 +69,55 @@ FULL_TESTS = [
     },
 ]
 
+# Optional Z-Image smoke test.
+# This runs only if a Z-Image model directory is auto-detected (or provided).
+ZIMAGE_SMOKE_TEST = {
+    "name": "Z-Image smoke test (2 steps, 256x256)",
+    "prompt": "A simple geometric logo",
+    "seed": 7,
+    "steps": 2,
+    "width": 256,
+    "height": 256,
+}
 
-def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
+
+def is_zimage_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a Z-Image model directory."""
+    if not model_dir.is_dir():
+        return False
+
+    model_index = model_dir / "model_index.json"
+    if not model_index.exists():
+        return False
+
+    try:
+        text = model_index.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+    return ("ZImagePipeline" in text) or ("Z-Image" in text)
+
+
+def detect_zimage_model_dir(explicit_dir: Optional[str]) -> Optional[Path]:
+    """Find a Z-Image model directory."""
+    if explicit_dir:
+        p = Path(explicit_dir)
+        return p if is_zimage_model_dir(p) else None
+
+    # Common local names first.
+    for p in (Path("zimage-turbo"), Path("zimage"), Path("Z-Image-Turbo")):
+        if is_zimage_model_dir(p):
+            return p
+
+    # Fallback: scan direct subdirectories.
+    for p in sorted(Path(".").iterdir()):
+        if p.is_dir() and is_zimage_model_dir(p):
+            return p
+
+    return None
+
+
+def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     """Run a single test case. Returns (passed, message)."""
     if "output" in test:
         output_path = test["output"]
@@ -78,7 +126,7 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
             output_path = f.name
 
     cmd = [
-        flux_binary,
+        binary,
         "-d", model_dir,
         "-p", test["prompt"],
         "--seed", str(test["seed"]),
@@ -95,11 +143,11 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            return False, f"flux exited with code {result.returncode}: {result.stderr}"
+            return False, f"process exited with code {result.returncode}: {result.stderr}"
     except subprocess.TimeoutExpired:
         return False, "timeout (300s)"
     except FileNotFoundError:
-        return False, f"binary not found: {flux_binary}"
+        return False, f"binary not found: {binary}"
 
     # If the test has no reference image, it's a visual-check-only test.
     if "reference" not in test:
@@ -142,9 +190,11 @@ def run_test(flux_binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run FLUX inference tests")
-    parser.add_argument("--flux-binary", default="./flux", help="Path to flux binary")
+    parser = argparse.ArgumentParser(description="Run Iris inference tests")
+    parser.add_argument("--flux-binary", default="./iris", help="Path to iris binary")
     parser.add_argument("--model-dir", default="flux-klein-4b", help="Path to model")
+    parser.add_argument("--zimage-model-dir", default=None,
+                        help="Optional Z-Image model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -156,16 +206,29 @@ def main():
         tests_to_run = list(TESTS)
     full_tests_to_run = list(FULL_TESTS) if args.full else []
 
-    total = len(tests_to_run) + len(full_tests_to_run)
+    # Optional zImage coverage: run only in non-quick mode.
+    scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
+    zimage_dir = detect_zimage_model_dir(args.zimage_model_dir)
+    if not args.quick:
+        if zimage_dir:
+            print(f"Detected Z-Image model dir: {zimage_dir}")
+            scheduled_tests.append((ZIMAGE_SMOKE_TEST, str(zimage_dir)))
+        elif args.zimage_model_dir:
+            print(f"Warning: --zimage-model-dir '{args.zimage_model_dir}' is not a valid Z-Image model dir")
+            print("Skipping optional Z-Image smoke test.")
+        else:
+            print("No Z-Image model dir detected; skipping optional Z-Image smoke test.")
+
+    total = len(scheduled_tests) + len(full_tests_to_run)
     print(f"Running {total} test(s)...\n")
 
     passed = 0
     failed = 0
     visual_checks = []
 
-    for i, test in enumerate(tests_to_run, 1):
+    for i, (test, model_dir) in enumerate(scheduled_tests, 1):
         print(f"[{i}/{total}] {test['name']}...")
-        ok, msg = run_test(args.flux_binary, test, args.model_dir)
+        ok, msg = run_test(args.flux_binary, test, model_dir)
 
         if ok:
             print(f"    PASS: {msg}")
@@ -174,11 +237,11 @@ def main():
             print(f"    FAIL: {msg}")
             failed += 1
 
-    for j, test in enumerate(full_tests_to_run, len(tests_to_run) + 1):
+    for j, test in enumerate(full_tests_to_run, len(scheduled_tests) + 1):
         print(f"[{j}/{total}] {test['name']}...")
 
         # Step 1: Generate a reference image to use as img2img input.
-        ref_path = "/tmp/flux_test_ref_1024.png"
+        ref_path = "/tmp/iris_test_ref_1024.png"
         print(f"    Step 1: Generating 1024x1024 reference image...")
         ref_cmd = [
             args.flux_binary, "-d", args.model_dir,
@@ -201,7 +264,7 @@ def main():
 
         # Step 2: Run img2img with the reference — this should trigger
         # the attention budget shrinking and print a resize note.
-        output_path = "/tmp/flux_test_img2img_1024.png"
+        output_path = "/tmp/iris_test_img2img_1024.png"
         print(f"    Step 2: Running img2img with attention budget "
               f"shrinking (reference should be auto-resized)...")
         test_with_input = dict(test)

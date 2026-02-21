@@ -1,12 +1,12 @@
 /*
- * Qwen3 Text Encoder for FLUX.2-klein
+ * Qwen3 Text Encoder for Iris
  *
- * Implements the Qwen3 text encoder that produces embeddings for FLUX image
+ * Implements the Qwen3 text encoder that produces embeddings for image
  * generation. Supports multiple model sizes (architecture read from config.json).
  */
 
-#ifndef FLUX_QWEN3_H
-#define FLUX_QWEN3_H
+#ifndef IRIS_QWEN3_H
+#define IRIS_QWEN3_H
 
 #include <stdint.h>
 
@@ -55,9 +55,10 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok);
 /*
  * Tokenize text with chat template.
  * Format: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+ * skip_think_tags: when non-zero, omit <think>...</think> suffix (used by Z-Image mode)
  */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
-                         int *num_tokens, int max_len);
+                         int *num_tokens, int max_len, int skip_think_tags);
 
 /*
  * Pad tokens to max_len with PAD token.
@@ -122,18 +123,35 @@ typedef struct qwen3_encoder {
 qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
 
 /*
+ * Set extraction mode:
+ *   0 = Flux: layers 8,17,26 concatenated -> [seq, 3*hidden] (default)
+ *   1 = Z-Image: layer (num_layers-2) only -> [seq, hidden]
+ */
+void qwen3_set_extraction_mode(qwen3_encoder_t *enc, int mode);
+
+/*
  * Free encoder resources.
  */
 void qwen3_encoder_free(qwen3_encoder_t *enc);
 
 /*
  * Encode text prompt to embeddings.
- * Returns: Embedding array [512, 7680] (caller must free)
+ * Returns: Embedding array [512, text_dim] (caller must free)
+ * text_dim is 7680 for Flux mode, hidden_size for Z-Image mode.
  */
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
+
+/*
+ * Encode text prompt to embeddings, returning actual token count.
+ * Same as qwen3_encode_text but also returns the number of real
+ * (non-padding) tokens in *out_num_tokens.
+ * Returns: Embedding array [512, text_dim] (caller must free)
+ */
+float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
+                              int *out_num_tokens);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* FLUX_QWEN3_H */
+#endif /* IRIS_QWEN3_H */

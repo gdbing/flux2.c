@@ -1,13 +1,18 @@
-# FLUX.2-klein Pure C Implementation
+# Iris - a C inference pipeline for image synthesis models
 
-This program generates images from text prompts (and optionally from other images) using the [FLUX.2-klein models](https://bfl.ai/models/flux-2-klein) from [Black Forest Labs](https://bfl.ai/). It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
-Supported models:
+The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
-- **Flux.2 Klein 4B distilled** (4 steps, auto guidance set to 1, very fast).
-- **Flux.2 Klein 4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
-- **Flux.2 Klein 9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
-- **Flux.2 Klein 9B base** (50 steps, CFG, highest quality. Non-commercial license).
+Supported model families:
+
+- **[FLUX.2 Klein](https://bfl.ai/models/flux-2-klein)** (by [Black Forest Labs](https://bfl.ai/)):
+  - **4B distilled** (4 steps, auto guidance set to 1, very fast).
+  - **4B base** (50 steps for max quality, or less. Classifier-Free Diffusion Guidance, much slower but more generation variety).
+  - **9B distilled** (4 steps, larger model, higher quality. Non-commercial license).
+  - **9B base** (50 steps, CFG, highest quality. Non-commercial license).
+- **[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)** (by Tongyi-MAI):
+  - **6B** (8 NFE / 9 scheduler steps, no CFG, fast).
 
 ## Quick Start
 
@@ -17,19 +22,19 @@ make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
-# Download the model (~16GB) - pick one:
+# Download a model (~16GB) - pick one:
 ./download_model.sh 4b                   # using curl
 # or: pip install huggingface_hub && python download_model.py 4b
 
 # Generate an image
-./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o output.png
+./iris -d flux-klein-4b -p "A woman wearing sunglasses" -o output.png
 ```
 
 If you want to try the base model, instead of the distilled one (much slower, higher quality), use the following instructions. Use 10 steps if your computer is quite slow, instead of the default of 50, it will still work well enough to test it (10 seconds to generate a 256x256 image on a MacBook M3 Max).
 ```
 ./download_model.sh 4b-base
 # or: pip install huggingface_hub && python download_model.py 4b-base
-./flux -d flux-klein-4b-base -p "A woman wearing sunglasses" -o output.png
+./iris -d flux-klein-4b-base -p "A woman wearing sunglasses" -o output.png
 ```
 
 If you want to try the 9B model (higher quality, non-commercial license, ~30GB download):
@@ -40,7 +45,14 @@ If you want to try the 9B model (higher quality, non-commercial license, ~30GB d
 ./download_model.sh 9b --token YOUR_TOKEN
 # or: python download_model.py 9b --token YOUR_TOKEN
 # or: set HF_TOKEN env var
-./flux -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
+./iris -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
+```
+
+For Z-Image-Turbo:
+```bash
+# Download Z-Image-Turbo (~12GB)
+pip install huggingface_hub && python download_model.py zimage-turbo
+./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
 That's it. No Python runtime or CUDA toolkit required at inference time.
@@ -49,26 +61,26 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 ![Woman with sunglasses](images/woman_with_sunglasses.png)
 
-*Generated with: `./flux -d flux-klein-4b -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
+*Generated with: `./iris -d flux-klein-4b -p "A picture of a woman in 1960 America. Sunglasses. ASA 400 film. Black and White." -W 512 -H 512 -o woman.png`*
 
 ### Image-to-Image Example
 
 ![antirez to drawing](images/antirez_to_drawing.png)
 
-*Generated with: `./flux -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-4b`*
+*Generated with: `./iris -i antirez.png -o antirez_to_drawing.png -p "make it a drawing" -d flux-klein-4b`*
 
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
-- **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
+- **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
-- **Image-to-image**: Transform existing images guided by prompts
+- **Image-to-image**: Transform existing images guided by prompts (Flux models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
-- **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256×256, then render at 512×512 with the same seed
+- **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256x256, then render at 512x512 with the same seed
 - **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, iTerm2, WezTerm, or Konsole).
 
 ### Terminal Image Display
@@ -79,10 +91,10 @@ Display generated images directly in your terminal with `--show`, or watch the d
 
 ```bash
 # Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2/WezTerm/Konsole)
-./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show
+./iris -d flux-klein-4b -p "a cute robot" -o robot.png --show
 
 # Display each denoising step (slower, but interesting to watch)
-./flux -d flux-klein-4b -p "a cute robot" -o robot.png --show-steps
+./iris -d flux-klein-4b -p "a cute robot" -o robot.png --show-steps
 ```
 
 Requires a terminal supporting the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (such as [Kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org/)), the iTerm2 inline image protocol ([iTerm2](https://iterm2.com/), [WezTerm](https://wezfurlong.org/wezterm/)), or [Konsole](https://konsole.kde.org/). Terminal type is auto-detected from environment variables.
@@ -94,7 +106,7 @@ Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1
 ### Text-to-Image
 
 ```bash
-./flux -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" -o cat.png
+./iris -d flux-klein-4b -p "A fluffy orange cat sitting on a windowsill" -o cat.png
 ```
 
 ### Image-to-Image
@@ -102,7 +114,7 @@ Use `--zoom N` to adjust the display size (default: 2 for Retina displays, use 1
 Transform an existing image based on a prompt:
 
 ```bash
-./flux -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
+./iris -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
 ```
 
 FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike traditional approaches that add noise to the input image, FLUX.2 passes the reference image as additional tokens that the model can attend to during generation. This means:
@@ -119,7 +131,7 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 **Super Resolution:** Since the reference image can be a different size than the output, you can use img2img for upscaling:
 
 ```bash
-./flux -d flux-klein-4b -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
+./iris -d flux-klein-4b -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
 ```
 
 The model will generate a higher-resolution version while preserving the composition and details of the input.
@@ -129,7 +141,7 @@ The model will generate a higher-resolution version while preserving the composi
 Combine elements from multiple reference images:
 
 ```bash
-./flux -d flux-klein-4b -i car.png -i beach.png -p "a sports car on the beach" -o result.png
+./iris -d flux-klein-4b -i car.png -i beach.png -p "a sports car on the beach" -o result.png
 ```
 
 Each reference image is encoded separately and passed to the transformer with different positional embeddings (T=10, T=20, T=30, ...). The model attends to all references during generation, allowing it to combine elements from each.
@@ -147,21 +159,21 @@ You can specify up to 16 reference images with multiple `-i` flags. The prompt g
 Start without `-p` to enter interactive mode:
 
 ```bash
-./flux -d flux-klein-4b
+./iris -d flux-klein-4b
 ```
 
 Generate images by typing prompts. Each image gets a `$N` reference ID:
 
 ```
-flux> a red sports car
-Done -> /tmp/flux-.../image-0001.png (ref $0)
+iris> a red sports car
+Done -> /tmp/iris-.../image-0001.png (ref $0)
 
-flux> a tropical beach
-Done -> /tmp/flux-.../image-0002.png (ref $1)
+iris> a tropical beach
+Done -> /tmp/iris-.../image-0002.png (ref $1)
 
-flux> $0 $1 combine them
+iris> $0 $1 combine them
 Generating 256x256 (multi-ref, 2 images)...
-Done -> /tmp/flux-.../image-0003.png (ref $2)
+Done -> /tmp/iris-.../image-0003.png (ref $2)
 ```
 
 **Prompt syntax:**
@@ -186,9 +198,9 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 ```
 -W, --width N         Output width in pixels (default: 256)
 -H, --height N        Output height in pixels (default: 256)
--s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base)
+-s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage)
 -S, --seed N          Random seed for reproducibility
--g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base)
+-g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage)
     --linear          Use linear timestep schedule (see below)
     --power           Use power curve timestep schedule (see below)
     --power-alpha N   Set power schedule exponent (default: 2.0)
@@ -222,7 +234,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 
 The seed is always printed to stderr, even when random:
 ```
-$ ./flux -d flux-klein-4b -p "a landscape" -o out.png
+$ ./iris -d flux-klein-4b -p "a landscape" -o out.png
 Seed: 1705612345
 ...
 Saving... out.png 256x256 (0.1s)
@@ -230,7 +242,7 @@ Saving... out.png 256x256 (0.1s)
 
 To reproduce the same image, use the printed seed:
 ```
-$ ./flux -d flux-klein-4b -p "a landscape" -o out.png -S 1705612345
+$ ./iris -d flux-klein-4b -p "a landscape" -o out.png -S 1705612345
 ```
 
 ## PNG Metadata
@@ -239,7 +251,7 @@ Generated PNG images include metadata with the seed and model information, so yo
 
 ```bash
 # Using exiftool
-exiftool image.png | grep flux
+exiftool image.png | grep iris
 
 # Using Python/PIL
 python3 -c "from PIL import Image; print(Image.open('image.png').info)"
@@ -249,8 +261,8 @@ identify -verbose image.png | grep -A1 "Properties:"
 ```
 
 The following metadata fields are stored:
-- `flux:seed` - The random seed used for generation
-- `flux:model` - The model name (e.g., FLUX.2-klein-4B, FLUX.2-klein-9B)
+- `iris:seed` - The random seed used for generation
+- `iris:model` - The model used
 - `Software` - Program identifier
 
 ## Building
@@ -290,7 +302,7 @@ make info       # Show available backends for this platform
 Run the test suite to verify your build produces correct output:
 
 ```bash
-make test        # Run all 3 tests
+make test        # Run all tests
 make test-quick  # Run only the quick 64x64 test
 ```
 
@@ -299,15 +311,16 @@ The tests compare generated images against reference images in `test_vectors/`. 
 **Test cases:**
 | Test | Size | Steps | Purpose |
 |------|------|-------|---------|
-| Quick | 64×64 | 2 | Fast txt2img sanity check |
-| Full | 512×512 | 4 | Validates txt2img at larger resolution |
-| img2img | 256×256 | 4 | Validates image-to-image transformation |
+| Quick | 64x64 | 2 | Fast txt2img sanity check |
+| Full | 512x512 | 4 | Validates txt2img at larger resolution |
+| img2img | 256x256 | 4 | Validates image-to-image transformation |
+| Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
 python3 run_test.py --help
-python3 run_test.py --quick          # Quick test only
-python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
+python3 run_test.py --quick
+python3 run_test.py --flux-binary ./iris --model-dir /path/to/model
 ```
 
 ## Model Download
@@ -337,16 +350,22 @@ Download model weights from HuggingFace using one of these methods:
 # You can also set the HF_TOKEN environment variable
 ```
 
+**Z-Image-Turbo** (~12GB):
+```bash
+pip install huggingface_hub && python download_model.py zimage-turbo
+```
+
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
 | 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
 | 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
+| Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
 
 ## How Fast Is It?
 
-Benchmarks on **Apple M3 Max** (128GB RAM), distilled model (4 steps).
+Benchmarks on **Apple M3 Max** (128GB RAM), Flux distilled model (4 steps).
 
 The MPS implementation is faster than the PyTorch optimized pipeline at all resolutions.
 
@@ -358,14 +377,14 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 
 **Notes:**
 - All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
-- The base model is roughly 25x slower (50 steps × 2 passes per step vs 4 steps × 1 pass). It actually produces acceptable results even with 10 steps, so you can tune quality/time. The 25x figure is not exactly accurate because it only covers the denoising steps: text encoding and VAE use the same time for both the models, however such steps are a minor percentage of the generation time.
+- The base model is roughly 25x slower (50 steps x 2 passes per step vs 4 steps x 1 pass). It actually produces acceptable results even with 10 steps, so you can tune quality/time. The 25x figure is not exactly accurate because it only covers the denoising steps: text encoding and VAE use the same time for both the models, however such steps are a minor percentage of the generation time.
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
 ### Community Benchmarks
 
-The following timings for 512x512 generation (distilled model, 4 steps) were reported by users of Flux2.c. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
+The following timings for 512x512 generation (Flux distilled model, 4 steps) were reported by users. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
 
 | Hardware | Backend | 512x512 |
 |----------|---------|---------|
@@ -387,7 +406,9 @@ Dimensions should be multiples of 16 (the VAE downsampling factor).
 
 ## Model Architecture
 
-All models share the same rectified flow transformer architecture, differing only in dimensions:
+### FLUX.2 Klein
+
+All Flux models share the same rectified flow transformer architecture, differing only in dimensions:
 
 | Component | 4B | 9B |
 |-----------|-----|-----|
@@ -411,36 +432,83 @@ The distilled and base variants differ in inference:
 
 The model type (distilled vs base, 4B vs 9B) is autodetected from the model directory. Use `--base` to force base model mode if autodetection fails.
 
-**Classifier-Free Guidance (CFG)**: The base model runs the transformer twice per step — once with an empty prompt (unconditioned) and once with the real prompt (conditioned). The final velocity is `v = v_uncond + guidance * (v_cond - v_uncond)`. This makes each step ~2x slower than the distilled model, and the base model needs ~12x more steps, making it roughly 25x slower overall.
+**Classifier-Free Guidance (CFG)**: The base model runs the transformer twice per step -- once with an empty prompt (unconditioned) and once with the real prompt (conditioned). The final velocity is `v = v_uncond + guidance * (v_cond - v_uncond)`. This makes each step ~2x slower than the distilled model, and the base model needs ~12x more steps, making it roughly 25x slower overall.
 
-## Timestep Schedule
+### Z-Image-Turbo
 
-By default, denoising uses a **shifted sigmoid** timestep schedule (matching the official BFL implementation). This schedule concentrates most steps in the high-noise regime and rushes through the detail-forming region near t=0. For the 4 steps distilled model, this is definitely the way to go, and changing scheduler will produce proor results.
+Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context refiners:
 
-### Linear scheduling
+| Component | Z-Image-Turbo |
+|-----------|---------------|
+| Transformer dim | 3840 |
+| Attention heads | 30 |
+| Head dim | 128 |
+| Main layers | 30 |
+| Refiner layers | 2 (noise) + 2 (context) |
+| Text Encoder | Qwen3-4B (hidden_states[-2]) |
+| VAE | 16 latent channels, patch_size=2 |
 
-However, for the base model, the shifted sigmoid shceduler may look extremely unbalanced — for example at 10 steps, the first 5 steps cover only 12% of the denoising trajectory while the last 5 steps cover 88%. Still, the base model works well with this scheduler, but after some testing I decided to add the `--linear` flag in order to switch to a uniform timestep schedule, where each step covers an equal portion of the trajectory. This sometimes produces better results with the **base model**, at least more realistic looking results, especially at reduced step count (10 steps, for instance, which is 1/5 of execution time compared to the default 50 steps), since the linear schedule avoids the huge final steps that the shifted sigmoid creates, and this alters the generation in a significant way, often in interesting ways.
+## Timestep Schedules
 
-### Power curve scheduler
+Each model family has its own default schedule. Alternative schedules (`--linear`, `--power`, `--sigmoid`, `--flowmatch`) are available for experimentation. Any schedule can be used with any model.
 
-The `--power` flag provides a middle ground: a power curve schedule (`t = 1 - (i/n)^α`) that is denser at the start and sparser at the end, but less extreme than the shifted sigmoid. The default exponent is 2.0 (quadratic); use `--power-alpha` to adjust it (1.0 = linear, higher = more front-loaded).
+### Flux Distilled (4B / 9B)
+
+The distilled models use a **shifted sigmoid** schedule (matching the official BFL distillation). This schedule concentrates most steps in the high-noise regime and is part of the distillation training -- changing it will produce poor results. Use 4 steps (the default).
+
+### Flux Base (4B-base / 9B-base)
+
+The base models default to the same shifted sigmoid schedule. At 50 steps it works very well, but 50 steps is slow. For quick tests, **10 steps** already produce decent results.
+
+The shifted sigmoid can look extremely unbalanced at low step counts -- for example at 10 steps, the first 5 steps cover only 12% of the denoising trajectory while the last 5 cover 88%. The `--linear` flag switches to a uniform schedule where each step covers an equal portion of the trajectory, which sometimes produces more realistic results at reduced step counts. The `--power` flag provides a middle ground: a power curve (`t = 1 - (i/n)^a`) that is denser at the start and sparser at the end, but less extreme than the shifted sigmoid. The default exponent is 2.0 (quadratic); use `--power-alpha` to adjust it (1.0 = linear, higher = more front-loaded).
 
 ```bash
-# Base model with 10 steps and linear schedule
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --linear
+# Base model, 10 steps with default schedule
+./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10
+
+# Base model with linear schedule
+./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --linear
 
 # Base model with power schedule (quadratic by default)
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power
+./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power
 
 # Power schedule with custom exponent
-./flux -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power-alpha 1.5
+./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --power-alpha 1.5
 ```
 
-In interactive CLI mode, toggle with `!linear` or `!power [alpha]`.
+### Z-Image-Turbo
 
-**Note**: for the distilled model (4 steps), the shifted sigmoid schedule is part of the distillation training, so alternative schedules are not recommended.
+Z-Image-Turbo uses the official diffusers **FlowMatch Euler** schedule by default (static shift). The default is 8 NFE (9 scheduler values, with the terminal sigma at 0 making the last step a no-op).
 
-If you have a terminal supporting the iTerm2 or Kitty terminal graphics protocols, it is strongly suggested to test the different schedulers with --show and --show-steps options. It is quite an experience to see the denoising process happening in different ways.
+For quick tests, **4 steps with `--linear`** works well and is twice as fast as the default:
+
+```bash
+# Default schedule (8 NFE)
+./iris -d zimage-turbo -p "a fish" -o fish.png
+
+# Quick test: 4 steps with linear schedule
+./iris -d zimage-turbo -p "a fish" -o fish.png -s 4 --linear
+```
+
+### Cross-model schedules
+
+You can use any schedule with any model via `--sigmoid` and `--flowmatch`:
+
+```bash
+# Flux base with Z-Image's FlowMatch schedule
+./iris -d flux-klein-4b-base -p "a cat" -o cat.png -s 10 --flowmatch
+
+# Z-Image with Flux's shifted sigmoid schedule
+./iris -d zimage-turbo -p "a fish" -o fish.png --sigmoid
+```
+
+This is not really useful with the Flux distilled models, but is interesting with both the base models of Flux and with Z-Image Turbo, even if it is a distilled model: the 9 steps training gives it enough flexibility, and other schedulers may be interesting especially at reduced steps count (quick preview).
+
+### Interactive mode
+
+In interactive CLI mode, toggle schedules with `!linear`, `!power [alpha]`, `!sigmoid`, or `!flowmatch`.
+
+If you have a terminal supporting the iTerm2 or Kitty terminal graphics protocols, it is strongly suggested to test the different schedulers with `--show` and `--show-steps` options. It is quite an experience to see the denoising process happening in different ways.
 
 ## Memory Requirements
 
@@ -487,8 +555,8 @@ The text encoder is automatically released after encoding, reducing peak memory 
 Memory-mapped weight loading is enabled by default. Use `--no-mmap` to disable and load all weights upfront.
 
 ```bash
-./flux -d flux-klein-4b -p "A cat" -o cat.png           # mmap (default)
-./flux -d flux-klein-4b -p "A cat" -o cat.png --no-mmap # load all upfront
+./iris -d flux-klein-4b -p "A cat" -o cat.png           # mmap (default)
+./iris -d flux-klein-4b -p "A cat" -o cat.png --no-mmap # load all upfront
 ```
 
 **How it works:** Instead of loading all model weights into RAM upfront, mmap keeps the safetensors files memory-mapped and loads weights on-demand:
@@ -496,65 +564,65 @@ Memory-mapped weight loading is enabled by default. Use `--no-mmap` to disable a
 - **Text encoder (Qwen3):** Each of the 36 transformer layers (~400MB each) is loaded, processed, and immediately freed. Only ~2GB stays resident instead of ~8GB.
 - **Denoising transformer:** Each of the 5 double-blocks (~300MB) and 20 single-blocks (~150MB) is loaded on-demand and freed after use. Only ~200MB of shared weights stays resident instead of ~4GB.
 
-This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB RAM systems where the Python ML stack cannot run FLUX.2 at all.
+This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB RAM systems where the Python ML stack cannot run at all.
 
 **Performance varies by backend:**
 
 - **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
 
-- **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16→f32 on every step (25 blocks × 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
+- **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
 - **Generic (pure C):** Same tradeoffs as BLAS, but slower overall.
 
 ## C Library API
 
-The library can be integrated into your own C/C++ projects. Link against `libflux.a` and include `flux.h`.
+The library can be integrated into your own C/C++ projects. Link against `libiris.a` and include `iris.h`.
 
 ### Text-to-Image Generation
 
 Here's a complete program that generates an image from a text prompt:
 
 ```c
-#include "flux.h"
+#include "iris.h"
 #include <stdio.h>
 
 int main(void) {
     /* Load the model. This loads VAE, transformer, and text encoder. */
-    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
+    iris_ctx *ctx = iris_load_dir("flux-klein-4b");
     if (!ctx) {
-        fprintf(stderr, "Failed to load model: %s\n", flux_get_error());
+        fprintf(stderr, "Failed to load model: %s\n", iris_get_error());
         return 1;
     }
 
     /* Configure generation parameters. Start with defaults and customize. */
-    flux_params params = FLUX_PARAMS_DEFAULT;
+    iris_params params = IRIS_PARAMS_DEFAULT;
     params.width = 512;
     params.height = 512;
     params.seed = 42;  /* Use -1 for random seed */
 
     /* Generate the image. This handles text encoding, diffusion, and VAE decode. */
-    flux_image *img = flux_generate(ctx, "A fluffy orange cat in a sunbeam", &params);
+    iris_image *img = iris_generate(ctx, "A fluffy orange cat in a sunbeam", &params);
     if (!img) {
-        fprintf(stderr, "Generation failed: %s\n", flux_get_error());
-        flux_free(ctx);
+        fprintf(stderr, "Generation failed: %s\n", iris_get_error());
+        iris_free(ctx);
         return 1;
     }
 
     /* Save to file. Format is determined by extension (.png or .ppm). */
-    flux_image_save(img, "cat.png");
+    iris_image_save(img, "cat.png");
     printf("Saved cat.png (%dx%d)\n", img->width, img->height);
 
     /* Clean up */
-    flux_image_free(img);
-    flux_free(ctx);
+    iris_image_free(img);
+    iris_free(ctx);
     return 0;
 }
 ```
 
 Compile with:
 ```bash
-gcc -o myapp myapp.c -L. -lflux -lm -framework Accelerate  # macOS
-gcc -o myapp myapp.c -L. -lflux -lm -lopenblas              # Linux
+gcc -o myapp myapp.c -L. -liris -lm -framework Accelerate  # macOS
+gcc -o myapp myapp.c -L. -liris -lm -lopenblas              # Linux
 ```
 
 ### Image-to-Image Transformation
@@ -562,41 +630,41 @@ gcc -o myapp myapp.c -L. -lflux -lm -lopenblas              # Linux
 Transform an existing image guided by a text prompt using in-context conditioning:
 
 ```c
-#include "flux.h"
+#include "iris.h"
 #include <stdio.h>
 
 int main(void) {
-    flux_ctx *ctx = flux_load_dir("flux-klein-4b");
+    iris_ctx *ctx = iris_load_dir("flux-klein-4b");
     if (!ctx) return 1;
 
     /* Load the input image */
-    flux_image *photo = flux_image_load("photo.png");
+    iris_image *photo = iris_image_load("photo.png");
     if (!photo) {
         fprintf(stderr, "Failed to load image\n");
-        flux_free(ctx);
+        iris_free(ctx);
         return 1;
     }
 
     /* Set up parameters. Output size defaults to input size. */
-    flux_params params = FLUX_PARAMS_DEFAULT;
+    iris_params params = IRIS_PARAMS_DEFAULT;
     params.seed = 123;
 
     /* Transform the image - describe the desired output */
-    flux_image *painting = flux_img2img(ctx, "oil painting of the scene, impressionist style",
+    iris_image *painting = iris_img2img(ctx, "oil painting of the scene, impressionist style",
                                          photo, &params);
-    flux_image_free(photo);  /* Done with input */
+    iris_image_free(photo);  /* Done with input */
 
     if (!painting) {
-        fprintf(stderr, "Transformation failed: %s\n", flux_get_error());
-        flux_free(ctx);
+        fprintf(stderr, "Transformation failed: %s\n", iris_get_error());
+        iris_free(ctx);
         return 1;
     }
 
-    flux_image_save(painting, "painting.png");
+    iris_image_save(painting, "painting.png");
     printf("Saved painting.png\n");
 
-    flux_image_free(painting);
-    flux_free(ctx);
+    iris_image_free(painting);
+    iris_free(ctx);
     return 0;
 }
 ```
@@ -606,36 +674,36 @@ int main(void) {
 When generating multiple images with different seeds but the same prompt, you can avoid reloading the text encoder:
 
 ```c
-flux_ctx *ctx = flux_load_dir("flux-klein-4b");
-flux_params params = FLUX_PARAMS_DEFAULT;
+iris_ctx *ctx = iris_load_dir("flux-klein-4b");
+iris_params params = IRIS_PARAMS_DEFAULT;
 params.width = 256;
 params.height = 256;
 
 /* Generate 5 variations with different seeds */
 for (int i = 0; i < 5; i++) {
-    flux_set_seed(1000 + i);
+    iris_set_seed(1000 + i);
 
-    flux_image *img = flux_generate(ctx, "A mountain landscape at sunset", &params);
+    iris_image *img = iris_generate(ctx, "A mountain landscape at sunset", &params);
 
     char filename[64];
     snprintf(filename, sizeof(filename), "landscape_%d.png", i);
-    flux_image_save(img, filename);
-    flux_image_free(img);
+    iris_image_save(img, filename);
+    iris_image_free(img);
 }
 
-flux_free(ctx);
+iris_free(ctx);
 ```
 
 Note: The text encoder (~8GB) is automatically released after the first generation to save memory. It reloads automatically if you use a different prompt.
 
 ### Error Handling
 
-All functions that can fail return NULL on error. Use `flux_get_error()` to get a description:
+All functions that can fail return NULL on error. Use `iris_get_error()` to get a description:
 
 ```c
-flux_ctx *ctx = flux_load_dir("nonexistent-model");
+iris_ctx *ctx = iris_load_dir("nonexistent-model");
 if (!ctx) {
-    fprintf(stderr, "Error: %s\n", flux_get_error());
+    fprintf(stderr, "Error: %s\n", iris_get_error());
     /* Prints something like: "Failed to load VAE - cannot generate images" */
     return 1;
 }
@@ -645,30 +713,30 @@ if (!ctx) {
 
 **Core functions:**
 ```c
-flux_ctx *flux_load_dir(const char *model_dir);   /* Load model, returns NULL on error */
-void flux_free(flux_ctx *ctx);                     /* Free all resources */
+iris_ctx *iris_load_dir(const char *model_dir);   /* Load model, returns NULL on error */
+void iris_free(iris_ctx *ctx);                     /* Free all resources */
 
-flux_image *flux_generate(flux_ctx *ctx, const char *prompt, const flux_params *params);
-flux_image *flux_img2img(flux_ctx *ctx, const char *prompt, const flux_image *input,
-                          const flux_params *params);
+iris_image *iris_generate(iris_ctx *ctx, const char *prompt, const iris_params *params);
+iris_image *iris_img2img(iris_ctx *ctx, const char *prompt, const iris_image *input,
+                          const iris_params *params);
 ```
 
 **Image handling:**
 ```c
-flux_image *flux_image_load(const char *path);     /* Load PNG, JPEG, or PPM */
-int flux_image_save(const flux_image *img, const char *path);  /* 0=success, -1=error */
-int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);  /* Save with metadata */
-flux_image *flux_image_resize(const flux_image *img, int new_w, int new_h);
-void flux_image_free(flux_image *img);
+iris_image *iris_image_load(const char *path);     /* Load PNG, JPEG, or PPM */
+int iris_image_save(const iris_image *img, const char *path);  /* 0=success, -1=error */
+int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t seed);  /* Save with metadata */
+iris_image *iris_image_resize(const iris_image *img, int new_w, int new_h);
+void iris_image_free(iris_image *img);
 ```
 
 **Utilities:**
 ```c
-void flux_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
-const char *flux_get_error(void);                  /* Get last error message */
-void flux_release_text_encoder(flux_ctx *ctx);     /* Manually free ~8GB (optional) */
-int flux_is_distilled(flux_ctx *ctx);              /* 1 = distilled, 0 = base */
-void flux_set_base_mode(flux_ctx *ctx);            /* Force base model mode */
+void iris_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
+const char *iris_get_error(void);                  /* Get last error message */
+void iris_release_text_encoder(iris_ctx *ctx);     /* Manually free ~8GB (optional) */
+int iris_is_distilled(iris_ctx *ctx);              /* 1 = distilled, 0 = base */
+void iris_set_base_mode(iris_ctx *ctx);            /* Force base model mode */
 ```
 
 ### Parameters
@@ -677,16 +745,16 @@ void flux_set_base_mode(flux_ctx *ctx);            /* Force base model mode */
 typedef struct {
     int width;              /* Output width in pixels (default: 256) */
     int height;             /* Output height in pixels (default: 256) */
-    int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base) */
+    int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base, 9 zimage) */
     int64_t seed;           /* Random seed, -1 for random (default: -1) */
-    float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base) */
+    float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base, 0.0 zimage) */
     int linear_schedule;    /* Use linear timestep schedule (0 = shifted sigmoid) */
     int power_schedule;     /* Use power curve timestep schedule */
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
-} flux_params;
+} iris_params;
 
 /* Initialize with sensible defaults (auto steps and guidance from model type) */
-#define FLUX_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
+#define IRIS_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
 ```
 
 ## Debugging
@@ -721,7 +789,7 @@ This saves to `/tmp/`:
 
 4. Run C with the same inputs:
 ```bash
-./flux -d flux-klein-4b --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
+./iris -d flux-klein-4b --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
 ```
 
 5. Compare the outputs visually or numerically.

@@ -1,10 +1,10 @@
 /*
- * FLUX Interactive CLI Mode
+ * Iris Interactive CLI Mode
  *
  * A REPL-style interface for image generation. Type prompts to generate
  * images, use bang commands (!help, !save, etc.) for control.
  *
- * Usage: flux -d model/  (without -p starts interactive mode)
+ * Usage: iris -d model/  (without -p starts interactive mode)
  */
 
 #include <stdio.h>
@@ -16,18 +16,21 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-#include "flux.h"
-#include "flux_kernels.h"
-#include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
+#include "iris.h"
+#include "iris_kernels.h"
+#include "iris_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN */
 #include "embcache.h"
 #include "linenoise.h"
 #include "terminals.h"
+#ifdef USE_METAL
+#include "iris_metal.h"
+#endif
 
 /* ======================================================================
  * Constants
  * ====================================================================== */
 
-#define CLI_HISTORY_FILE ".flux_history"
+#define CLI_HISTORY_FILE ".iris_history"
 #define CLI_MAX_PATH 4096
 #define CLI_MAX_TMPDIR 256
 #define CLI_DEFAULT_WIDTH 256
@@ -49,7 +52,7 @@ typedef struct {
 } cli_ref;
 
 typedef struct {
-    flux_ctx *ctx;
+    iris_ctx *ctx;
     char model_dir[CLI_MAX_PATH];
     char tmpdir[CLI_MAX_TMPDIR];
     char last_image[CLI_MAX_PATH];
@@ -58,8 +61,7 @@ typedef struct {
     int steps;
     float guidance;
     int64_t seed;
-    int linear_schedule;
-    int power_schedule;
+    int schedule;
     float power_alpha;
     int image_count;
     int show_enabled;
@@ -72,6 +74,23 @@ typedef struct {
 } cli_state;
 
 static cli_state state;
+
+static const char *schedule_name(int sched) {
+    switch (sched) {
+    case IRIS_SCHEDULE_LINEAR:    return "linear";
+    case IRIS_SCHEDULE_POWER:     return "power";
+    case IRIS_SCHEDULE_SIGMOID:   return "sigmoid";
+    case IRIS_SCHEDULE_FLOWMATCH: return "flowmatch";
+    default:
+        if (iris_is_zimage(state.ctx)) return "flowmatch (default)";
+        return "sigmoid (default)";
+    }
+}
+
+static int cli_default_steps(iris_ctx *ctx) {
+    if (iris_is_zimage(ctx)) return 9;
+    return iris_is_distilled(ctx) ? 4 : 50;
+}
 
 /* ======================================================================
  * Reference Management ($N syntax)
@@ -209,7 +228,7 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
  * ====================================================================== */
 
 static int create_tmpdir(void) {
-    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/flux-XXXXXX");
+    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/iris-XXXXXX");
     if (mkdtemp(state.tmpdir) == NULL) {
         fprintf(stderr, "Error: Cannot create temp directory: %s\n",
                 strerror(errno));
@@ -227,7 +246,7 @@ static void get_image_path(char *buf, size_t size) {
  * Image Display
  * ====================================================================== */
 
-static void cli_step_image_cb(int step, int total, const flux_image *img) {
+static void cli_step_image_cb(int step, int total, const iris_image *img) {
     (void)total;
     fprintf(stderr, "\n[Step %d]\n", step);
     terminal_display_image(img, cli_term_proto);
@@ -235,10 +254,10 @@ static void cli_step_image_cb(int step, int total, const flux_image *img) {
 
 static void display_image(const char *path) {
     if (state.show_enabled) {
-        flux_image *img = flux_image_load(path);
+        iris_image *img = iris_image_load(path);
         if (img) {
             terminal_display_image(img, cli_term_proto);
-            flux_image_free(img);
+            iris_image_free(img);
         }
     }
     if (state.open_enabled) {
@@ -286,33 +305,44 @@ static void cli_step_progress(int step, int total) {
     fflush(stderr);
 }
 
-static void cli_substep_progress(flux_substep_type_t type, int index, int total) {
+static void cli_substep_progress(iris_substep_type_t type, int index, int total) {
     (void)index;
     (void)total;
-    if (type == FLUX_SUBSTEP_DOUBLE_BLOCK)
+    if (type == IRIS_SUBSTEP_DOUBLE_BLOCK)
         fprintf(stderr, "d");
-    else if (type == FLUX_SUBSTEP_SINGLE_BLOCK)
+    else if (type == IRIS_SUBSTEP_SINGLE_BLOCK)
         fprintf(stderr, "s");
-    else if (type == FLUX_SUBSTEP_FINAL_LAYER)
+    else if (type == IRIS_SUBSTEP_FINAL_LAYER)
         fprintf(stderr, "f");
     fflush(stderr);
 }
 
 static void cli_progress_start(void) {
     cli_progress_phase = PROG_NONE;
-    flux_text_progress_callback = cli_text_progress;
-    flux_vae_progress_callback = cli_vae_progress;
-    flux_step_callback = cli_step_progress;
-    flux_substep_callback = cli_substep_progress;
+    iris_text_progress_callback = cli_text_progress;
+    iris_vae_progress_callback = cli_vae_progress;
+    iris_step_callback = cli_step_progress;
+    iris_substep_callback = cli_substep_progress;
 }
 
 static void cli_progress_end(void) {
     fprintf(stderr, "\n");
     cli_progress_phase = PROG_NONE;
-    flux_text_progress_callback = NULL;
-    flux_vae_progress_callback = NULL;
-    flux_step_callback = NULL;
-    flux_substep_callback = NULL;
+    iris_text_progress_callback = NULL;
+    iris_vae_progress_callback = NULL;
+    iris_step_callback = NULL;
+    iris_substep_callback = NULL;
+}
+
+/* In interactive mode we reuse the same process/context across generations.
+ * Keep this hook to close any stray tensor batch/chain scopes between runs
+ * without flushing model/weight caches (which would add startup lag). */
+static void cli_prepare_next_generation(void) {
+#ifdef USE_METAL
+    if (!state.ctx || !iris_is_zimage(state.ctx)) return;
+    iris_gpu_batch_end();
+    iris_gpu_chain_end();
+#endif
 }
 
 /* ======================================================================
@@ -321,11 +351,10 @@ static void cli_progress_end(void) {
 
 static int generate_image(const char *prompt, const char *ref_image,
                           int explicit_width, int explicit_height) {
-    flux_params params = FLUX_PARAMS_DEFAULT;
+    iris_params params = IRIS_PARAMS_DEFAULT;
     params.num_steps = state.steps;
     params.guidance = state.guidance;
-    params.linear_schedule = state.linear_schedule;
-    params.power_schedule = state.power_schedule;
+    params.schedule = state.schedule;
     params.power_alpha = state.power_alpha;
 
     /* Determine seed */
@@ -338,23 +367,33 @@ static int generate_image(const char *prompt, const char *ref_image,
     params.seed = actual_seed;
     printf("Seed: %lld\n", (long long)actual_seed);
 
+    /* Validate / preload reference before enabling progress callbacks. */
+    iris_image *ref = NULL;
+    if (ref_image) {
+        if (iris_is_zimage(state.ctx)) {
+            fprintf(stderr, "Error: img2img is not supported for Z-Image.\n");
+            return -1;
+        }
+        ref = iris_image_load(ref_image);
+        if (!ref) {
+            fprintf(stderr, "Error: Cannot load '%s'\n", ref_image);
+            return -1;
+        }
+    }
+
     /* Start timing */
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     /* Set up progress callbacks */
+    cli_prepare_next_generation();
     cli_progress_start();
     if (state.show_steps_enabled)
-        flux_set_step_image_callback(state.ctx, cli_step_image_cb);
+        iris_set_step_image_callback(state.ctx, cli_step_image_cb);
 
     /* Generate */
-    flux_image *img;
+    iris_image *img = NULL;
     if (ref_image) {
-        flux_image *ref = flux_image_load(ref_image);
-        if (!ref) {
-            fprintf(stderr, "Error: Cannot load '%s'\n", ref_image);
-            return -1;
-        }
         /* Use explicit size if provided, otherwise use reference image dimensions */
         if (explicit_width > 0 && explicit_height > 0) {
             params.width = explicit_width;
@@ -364,8 +403,7 @@ static int generate_image(const char *prompt, const char *ref_image,
             params.height = ref->height;
         }
         printf("Generating %dx%d (img2img)...\n", params.width, params.height);
-        img = flux_img2img(state.ctx, prompt, ref, &params);
-        flux_image_free(ref);
+        img = iris_img2img(state.ctx, prompt, ref, &params);
     } else {
         /* Text-to-image: use explicit size if provided, otherwise state defaults */
         if (explicit_width > 0 && explicit_height > 0) {
@@ -377,27 +415,37 @@ static int generate_image(const char *prompt, const char *ref_image,
         }
         printf("Generating %dx%d...\n", params.width, params.height);
 
-        if (!flux_is_distilled(state.ctx)) {
-            /* Base model: use flux_generate() which handles CFG internally
-             * (needs both conditioned and unconditioned text encoding) */
-            img = flux_generate(state.ctx, prompt, &params);
+        if (!iris_is_distilled(state.ctx)) {
+            /* Base model: use iris_generate() which handles CFG internally
+             * (needs both conditioned and unconditioned text encoding). */
+            img = iris_generate(state.ctx, prompt, &params);
         } else {
             /* Distilled model: use embedding cache for faster repeat prompts */
-            float *embeddings = emb_cache_lookup(prompt);
+            int seq_len = QWEN3_MAX_SEQ_LEN;
+            int emb_elements = 0;
+            int text_dim = iris_text_dim(state.ctx);
+            float *embeddings = emb_cache_lookup_ex(prompt, &emb_elements);
+            if (embeddings) {
+                if (text_dim <= 0 || emb_elements <= 0 || (emb_elements % text_dim) != 0) {
+                    /* Cache metadata mismatch: treat as miss. */
+                    free(embeddings);
+                    embeddings = NULL;
+                } else {
+                    seq_len = emb_elements / text_dim;
+                }
+            }
             if (embeddings) {
                 printf("(using cached embedding)\n");
-                img = flux_generate_with_embeddings(state.ctx, embeddings,
-                                                     QWEN3_MAX_SEQ_LEN, &params);
+                img = iris_generate_with_embeddings(state.ctx, embeddings, seq_len, &params);
                 free(embeddings);
             } else {
                 /* Encode and cache for next time */
-                int seq_len;
-                embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
+                embeddings = iris_encode_text(state.ctx, prompt, &seq_len);
                 if (embeddings) {
                     emb_cache_store(prompt, embeddings,
-                                    seq_len * flux_text_dim(state.ctx));
-                    flux_release_text_encoder(state.ctx);
-                    img = flux_generate_with_embeddings(state.ctx, embeddings,
+                                    seq_len * text_dim);
+                    iris_release_text_encoder(state.ctx);
+                    img = iris_generate_with_embeddings(state.ctx, embeddings,
                                                          seq_len, &params);
                     free(embeddings);
                 } else {
@@ -408,7 +456,8 @@ static int generate_image(const char *prompt, const char *ref_image,
     }
 
     cli_progress_end();
-    flux_set_step_image_callback(state.ctx, NULL);
+    iris_set_step_image_callback(state.ctx, NULL);
+    if (ref) iris_image_free(ref);
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -416,15 +465,15 @@ static int generate_image(const char *prompt, const char *ref_image,
                      (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
     if (!img) {
-        fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
+        fprintf(stderr, "Error: Generation failed: %s\n", iris_get_error());
         return -1;
     }
 
     /* Save to temp */
     char path[CLI_MAX_PATH];
     get_image_path(path, sizeof(path));
-    flux_image_save_with_seed(img, path, actual_seed);
-    flux_image_free(img);
+    iris_image_save_with_seed(img, path, actual_seed);
+    iris_image_free(img);
 
     /* Update last image and register as reference */
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
@@ -438,11 +487,15 @@ static int generate_image(const char *prompt, const char *ref_image,
 
 static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs,
                              int explicit_width, int explicit_height) {
-    flux_params params = FLUX_PARAMS_DEFAULT;
+    if (iris_is_zimage(state.ctx)) {
+        fprintf(stderr, "Error: multi-reference img2img is not supported for Z-Image.\n");
+        return -1;
+    }
+
+    iris_params params = IRIS_PARAMS_DEFAULT;
     params.num_steps = state.steps;
     params.guidance = state.guidance;
-    params.linear_schedule = state.linear_schedule;
-    params.power_schedule = state.power_schedule;
+    params.schedule = state.schedule;
     params.power_alpha = state.power_alpha;
 
     /* Determine seed */
@@ -460,12 +513,12 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     /* Load reference images */
-    flux_image **refs = (flux_image **)malloc(num_refs * sizeof(flux_image *));
+    iris_image **refs = (iris_image **)malloc(num_refs * sizeof(iris_image *));
     for (int i = 0; i < num_refs; i++) {
-        refs[i] = flux_image_load(ref_paths[i]);
+        refs[i] = iris_image_load(ref_paths[i]);
         if (!refs[i]) {
             fprintf(stderr, "Error: Cannot load '%s'\n", ref_paths[i]);
-            for (int j = 0; j < i; j++) flux_image_free(refs[j]);
+            for (int j = 0; j < i; j++) iris_image_free(refs[j]);
             free(refs);
             return -1;
         }
@@ -483,21 +536,22 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     printf("Generating %dx%d (multi-ref, %d images)...\n",
            params.width, params.height, num_refs);
 
+    cli_prepare_next_generation();
     cli_progress_start();
     if (state.show_steps_enabled)
-        flux_set_step_image_callback(state.ctx, cli_step_image_cb);
+        iris_set_step_image_callback(state.ctx, cli_step_image_cb);
 
-    flux_image *img = flux_multiref(state.ctx, prompt,
-                                     (const flux_image **)refs, num_refs, &params);
+    iris_image *img = iris_multiref(state.ctx, prompt,
+                                     (const iris_image **)refs, num_refs, &params);
 
     /* Free reference images */
     for (int i = 0; i < num_refs; i++) {
-        flux_image_free(refs[i]);
+        iris_image_free(refs[i]);
     }
     free(refs);
 
     cli_progress_end();
-    flux_set_step_image_callback(state.ctx, NULL);
+    iris_set_step_image_callback(state.ctx, NULL);
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -505,15 +559,15 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
                      (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
     if (!img) {
-        fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
+        fprintf(stderr, "Error: Generation failed: %s\n", iris_get_error());
         return -1;
     }
 
     /* Save to temp */
     char path[CLI_MAX_PATH];
     get_image_path(path, sizeof(path));
-    flux_image_save_with_seed(img, path, actual_seed);
-    flux_image_free(img);
+    iris_image_save_with_seed(img, path, actual_seed);
+    iris_image_free(img);
 
     /* Update last image and register as reference */
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
@@ -538,9 +592,15 @@ static void cmd_help(void) {
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
     printf("  !steps <n>            Set sampling steps (0 = auto)\n");
-    printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
+    if (iris_is_zimage(state.ctx)) {
+        printf("  !guidance <n>         Set guidance (ignored for Z-Image, fixed at 0.0)\n");
+    } else {
+        printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
+    }
     printf("  !linear               Toggle linear timestep schedule\n");
     printf("  !power [alpha]        Toggle power schedule (default alpha: 2.0)\n");
+    printf("  !sigmoid              Toggle Flux shifted sigmoid schedule\n");
+    printf("  !flowmatch            Toggle Z-Image FlowMatch Euler schedule\n");
     printf("  !explore <n> <prompt> Generate n thumbnail variations\n");
     printf("  !show                 Toggle terminal display\n");
     printf("  !show-steps           Toggle showing each denoising step\n");
@@ -574,21 +634,21 @@ static void cmd_save(char *arg) {
     } else {
         /* Generate default name */
         time_t t = time(NULL);
-        snprintf(dest, sizeof(dest), "flux_%ld.png", (long)t);
+        snprintf(dest, sizeof(dest), "iris_%ld.png", (long)t);
     }
 
     /* Copy file */
-    flux_image *img = flux_image_load(state.last_image);
+    iris_image *img = iris_image_load(state.last_image);
     if (!img) {
         fprintf(stderr, "Error: Cannot load last image.\n");
         return;
     }
-    if (flux_image_save(img, dest) == 0) {
+    if (iris_image_save(img, dest) == 0) {
         printf("Saved: %s\n", dest);
     } else {
         fprintf(stderr, "Error: Cannot save to '%s'\n", dest);
     }
-    flux_image_free(img);
+    iris_image_free(img);
 }
 
 static void cmd_load(char *arg) {
@@ -599,7 +659,7 @@ static void cmd_load(char *arg) {
         return;
     }
 
-    flux_image *img = flux_image_load(arg);
+    iris_image *img = iris_image_load(arg);
     if (!img) {
         fprintf(stderr, "Error: Cannot load '%s'\n", arg);
         return;
@@ -608,7 +668,7 @@ static void cmd_load(char *arg) {
     /* Save to temp so we have a consistent path */
     char path[CLI_MAX_PATH];
     get_image_path(path, sizeof(path));
-    flux_image_save(img, path);
+    iris_image_save(img, path);
 
     /* Update state and register as reference */
     snprintf(state.last_image, sizeof(state.last_image), "%s", path);
@@ -623,7 +683,7 @@ static void cmd_load(char *arg) {
         terminal_display_image(img, cli_term_proto);
     }
 
-    flux_image_free(img);
+    iris_image_free(img);
 }
 
 static void cmd_seed(char *arg) {
@@ -681,7 +741,7 @@ static void cmd_steps(char *arg) {
     int val = atoi(arg);
     if (val == 0) {
         /* Reset to model default */
-        state.steps = flux_is_distilled(state.ctx) ? 4 : 50;
+        state.steps = cli_default_steps(state.ctx);
         printf("Steps: %d (auto)\n", state.steps);
         return;
     }
@@ -698,6 +758,12 @@ static void cmd_guidance(char *arg) {
 
     if (!*arg) {
         printf("Guidance: %.1f\n", state.guidance);
+        return;
+    }
+
+    if (iris_is_zimage(state.ctx)) {
+        state.guidance = 0.0f;
+        printf("Guidance is fixed to 0.0 for Z-Image.\n");
         return;
     }
 
@@ -758,17 +824,16 @@ static void cmd_explore(char *arg) {
     printf("Generating %d images at %dx%d...\n",
            count, state.width, state.height);
 
-    flux_params params = FLUX_PARAMS_DEFAULT;
+    iris_params params = IRIS_PARAMS_DEFAULT;
     params.width = state.width;
     params.height = state.height;
     params.num_steps = state.steps;
     params.guidance = state.guidance;
-    params.linear_schedule = state.linear_schedule;
-    params.power_schedule = state.power_schedule;
+    params.schedule = state.schedule;
     params.power_alpha = state.power_alpha;
 
-    if (!flux_is_distilled(state.ctx)) {
-        /* Base model: use flux_generate() for CFG support */
+    if (!iris_is_distilled(state.ctx)) {
+        /* Base model: use iris_generate() for CFG support */
         for (int i = 0; i < count; i++) {
             int64_t seed = (int64_t)time(NULL) ^ (int64_t)rand() ^ (int64_t)i;
             params.seed = seed;
@@ -776,10 +841,11 @@ static void cmd_explore(char *arg) {
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
             fflush(stdout);
 
-            flux_image *img = flux_generate(state.ctx, prompt, &params);
+            cli_prepare_next_generation();
+            iris_image *img = iris_generate(state.ctx, prompt, &params);
             if (img) {
                 terminal_display_image(img, cli_term_proto);
-                flux_image_free(img);
+                iris_image_free(img);
                 printf("\n");
             } else {
                 printf("(failed)\n");
@@ -787,20 +853,31 @@ static void cmd_explore(char *arg) {
         }
     } else {
         /* Distilled model: use embedding cache for faster repeat prompts */
+        int text_dim = iris_text_dim(state.ctx);
         int seq_len = QWEN3_MAX_SEQ_LEN;
-        float *embeddings = emb_cache_lookup(prompt);
+        int emb_elements = 0;
+        float *embeddings = emb_cache_lookup_ex(prompt, &emb_elements);
+
+        if (embeddings) {
+            if (text_dim <= 0 || emb_elements <= 0 || (emb_elements % text_dim) != 0) {
+                free(embeddings);
+                embeddings = NULL;
+            } else {
+                seq_len = emb_elements / text_dim;
+            }
+        }
 
         if (embeddings) {
             printf("(using cached embedding)\n");
         } else {
-            embeddings = flux_encode_text(state.ctx, prompt, &seq_len);
+            embeddings = iris_encode_text(state.ctx, prompt, &seq_len);
             if (!embeddings) {
                 fprintf(stderr, "Error: Failed to encode prompt.\n");
                 free(prompt_to_free);
                 return;
             }
-            emb_cache_store(prompt, embeddings, seq_len * flux_text_dim(state.ctx));
-            flux_release_text_encoder(state.ctx);
+            emb_cache_store(prompt, embeddings, seq_len * text_dim);
+            iris_release_text_encoder(state.ctx);
         }
 
         for (int i = 0; i < count; i++) {
@@ -810,11 +887,12 @@ static void cmd_explore(char *arg) {
             printf("  [%d/%d] Seed: %lld ", i + 1, count, (long long)seed);
             fflush(stdout);
 
-            flux_image *img = flux_generate_with_embeddings(state.ctx, embeddings,
+            cli_prepare_next_generation();
+            iris_image *img = iris_generate_with_embeddings(state.ctx, embeddings,
                                                              seq_len, &params);
             if (img) {
                 terminal_display_image(img, cli_term_proto);
-                flux_image_free(img);
+                iris_image_free(img);
                 printf("\n");
             } else {
                 printf("(failed)\n");
@@ -887,21 +965,28 @@ static int process_command(char *line) {
     } else if (starts_with_ci(cmd, "guidance")) {
         cmd_guidance(cmd + 8);
     } else if (starts_with_ci(cmd, "linear")) {
-        state.linear_schedule = !state.linear_schedule;
-        if (state.linear_schedule) state.power_schedule = 0;
-        printf("Schedule: %s\n", state.linear_schedule ? "linear" : "shifted sigmoid");
+        state.schedule = (state.schedule == IRIS_SCHEDULE_LINEAR)
+                         ? IRIS_SCHEDULE_DEFAULT : IRIS_SCHEDULE_LINEAR;
+        printf("Schedule: %s\n", schedule_name(state.schedule));
     } else if (starts_with_ci(cmd, "power")) {
         char *arg = skip_spaces(cmd + 5);
         if (*arg) {
             float val = atof(arg);
             if (val > 0) state.power_alpha = val;
         }
-        state.power_schedule = !state.power_schedule;
-        if (state.power_schedule) state.linear_schedule = 0;
-        printf("Schedule: %s\n", state.power_schedule ?
-               "power" : "shifted sigmoid");
-        if (state.power_schedule)
+        state.schedule = (state.schedule == IRIS_SCHEDULE_POWER)
+                         ? IRIS_SCHEDULE_DEFAULT : IRIS_SCHEDULE_POWER;
+        printf("Schedule: %s\n", schedule_name(state.schedule));
+        if (state.schedule == IRIS_SCHEDULE_POWER)
             printf("Power alpha: %.1f\n", state.power_alpha);
+    } else if (starts_with_ci(cmd, "sigmoid")) {
+        state.schedule = (state.schedule == IRIS_SCHEDULE_SIGMOID)
+                         ? IRIS_SCHEDULE_DEFAULT : IRIS_SCHEDULE_SIGMOID;
+        printf("Schedule: %s\n", schedule_name(state.schedule));
+    } else if (starts_with_ci(cmd, "flowmatch")) {
+        state.schedule = (state.schedule == IRIS_SCHEDULE_FLOWMATCH)
+                         ? IRIS_SCHEDULE_DEFAULT : IRIS_SCHEDULE_FLOWMATCH;
+        printf("Schedule: %s\n", schedule_name(state.schedule));
     } else if (starts_with_ci(cmd, "explore")) {
         cmd_explore(cmd + 7);
     } else if (starts_with_ci(cmd, "show-steps") ||
@@ -1006,8 +1091,8 @@ static int process_prompt(char *line) {
  * ====================================================================== */
 
 static void print_banner(void) {
-    printf("\nFLUX.2 Interactive Mode\n");
-    printf("=======================\n");
+    printf("\nIris Interactive Mode\n");
+    printf("=====================\n");
     printf("Model: %s\n", state.model_dir);
 
     if (state.show_enabled) {
@@ -1018,14 +1103,18 @@ static void print_banner(void) {
         printf("Display: Images saved to %s/\n", state.tmpdir);
     }
 
-    printf("Type: %s\n", flux_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
+    if (iris_is_zimage(state.ctx)) {
+        printf("Type: Z-Image-Turbo (S3-DiT)\n");
+    } else {
+        printf("Type: %s\n", iris_is_distilled(state.ctx) ? "distilled" : "base (CFG)");
+    }
     printf("\nType a prompt to generate an image. Use !help for commands.\n");
     printf("Default size: %dx%d | Steps: %d | Seed: %s\n\n",
            state.width, state.height, state.steps,
            state.seed < 0 ? "random" : "fixed");
 }
 
-int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
+int iris_cli_run(iris_ctx *ctx, const char *model_dir) {
     /* Initialize state */
     memset(&state, 0, sizeof(state));
     state.ctx = ctx;
@@ -1033,7 +1122,7 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
     state.width = CLI_DEFAULT_WIDTH;
     state.height = CLI_DEFAULT_HEIGHT;
     /* Use model defaults for steps and guidance */
-    state.steps = flux_is_distilled(ctx) ? 4 : 50;
+    state.steps = cli_default_steps(ctx);
     state.guidance = 0.0f;  /* 0 = auto from model type */
     state.seed = -1;
     state.power_alpha = 2.0f;
@@ -1065,7 +1154,7 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
 
     /* Main loop */
     char *line;
-    while ((line = linenoise("flux> ")) != NULL) {
+    while ((line = linenoise("iris> ")) != NULL) {
         trim_trailing(line);
 
         if (*line) {
