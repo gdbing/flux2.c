@@ -18,6 +18,8 @@
 #include "iris_metal.h"
 #endif
 
+extern int iris_cancel_requested(void);
+
 /* Timing utilities for performance analysis - use wall-clock time */
 static double get_time_ms(void) {
     struct timeval tv;
@@ -298,6 +300,11 @@ float *iris_sample_euler_flux(void *transformer, void *text_encoder,
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
@@ -399,6 +406,11 @@ float *iris_sample_euler_zimage(void *transformer,
     }
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(step_latent);
+            free(z_curr);
+            return NULL;
+        }
         float sigma = schedule[step];
         float sigma_next = schedule[step + 1];
         float dt = sigma_next - sigma;  /* Negative for denoising */
@@ -511,6 +523,11 @@ float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -587,6 +604,11 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -667,6 +689,11 @@ float *iris_sample_euler_cfg_flux(void *transformer, void *text_encoder,
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -747,6 +774,11 @@ float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -828,6 +860,11 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
     double step_times[IRIS_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -906,6 +943,12 @@ float *iris_sample_euler_ancestral(void *transformer,
     iris_copy(z_curr, z, latent_size);
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(noise);
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;
@@ -969,6 +1012,12 @@ float *iris_sample_heun(void *transformer,
     iris_copy(z_curr, z, latent_size);
 
     for (int step = 0; step < num_steps; step++) {
+        if (iris_cancel_requested()) {
+            free(z_pred);
+            free(z_curr);
+            iris_transformer_free_mmap_cache_flux(tf);
+            return NULL;
+        }
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;

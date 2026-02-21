@@ -288,6 +288,14 @@ const char *iris_get_error(void);
 typedef void (*iris_step_image_cb_t)(int step, int total, const iris_image *img);
 void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback);
 
+/*
+ * Cooperative cancellation for in-progress generation.
+ * A cancel request is checked between sampling steps.
+ */
+void iris_request_cancel(void);
+void iris_clear_cancel(void);
+int iris_cancel_requested(void);
+
 /* ========================================================================
  * Advanced / Low-level API
  * ======================================================================== */

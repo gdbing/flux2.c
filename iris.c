@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -208,9 +209,22 @@ struct iris_ctx {
 
 /* Global error message */
 static char g_error_msg[256] = {0};
+static _Atomic int g_cancel_requested = 0;
 
 const char *iris_get_error(void) {
     return g_error_msg;
+}
+
+void iris_request_cancel(void) {
+    atomic_store_explicit(&g_cancel_requested, 1, memory_order_relaxed);
+}
+
+void iris_clear_cancel(void) {
+    atomic_store_explicit(&g_cancel_requested, 0, memory_order_relaxed);
+}
+
+int iris_cancel_requested(void) {
+    return atomic_load_explicit(&g_cancel_requested, memory_order_relaxed);
 }
 
 void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback) {
