@@ -1166,6 +1166,154 @@ static int fit_refs_for_attention(int num_heads,
  * Image-to-Image Generation
  * ======================================================================== */
 
+/* Image-to-image generation with pre-computed text embeddings.
+ * This mirrors iris_img2img() but skips prompt tokenization/encoding.
+ * As with iris_generate_with_embeddings(), only the distilled path is
+ * supported because CFG requires separate conditioned/unconditioned embeddings. */
+iris_image *iris_img2img_with_embeddings(
+    iris_ctx *ctx,
+    const float *text_emb,
+    int text_seq,
+    const iris_image *input,
+    const iris_params *params
+) {
+    if (!ctx || !text_emb || text_seq <= 0 || !input) {
+        set_error("Invalid context, embeddings, or input image");
+        return NULL;
+    }
+    if (ctx->is_zimage) {
+        set_error("img2img is not supported for Z-Image");
+        return NULL;
+    }
+
+    if (!ctx->is_distilled) {
+        fprintf(stderr, "Warning: iris_img2img_with_embeddings() does not "
+                        "support CFG. Use iris_img2img() for base models.\n");
+    }
+
+    iris_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
+    }
+
+    if (p.width <= 0) p.width = input->width;
+    if (p.height <= 0) p.height = input->height;
+
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM /
+                      (p.width > p.height ? p.width : p.height);
+        p.width = (int)(p.width * scale);
+        p.height = (int)(p.height * scale);
+    }
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+
+    int ref_w = p.width, ref_h = p.height;
+    {
+        int ref_dims[2] = { p.height, p.width };
+        if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
+                                   ref_dims, 1, IRIS_MAX_SEQ_LEN)) {
+            fprintf(stderr, "Note: reference image resized from %dx%d to %dx%d "
+                    "(GPU attention memory limit)\n",
+                    p.width, p.height, ref_dims[1], ref_dims[0]);
+            ref_h = ref_dims[0];
+            ref_w = ref_dims[1];
+        }
+    }
+
+    iris_image *resized = NULL;
+    const iris_image *img_to_use = input;
+    if (input->width != ref_w || input->height != ref_h) {
+        resized = iris_image_resize(input, ref_w, ref_h);
+        if (!resized) {
+            set_error("Failed to resize input image");
+            return NULL;
+        }
+        img_to_use = resized;
+    }
+
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+
+    iris_release_text_encoder(ctx);
+
+    if (!iris_load_transformer_if_needed(ctx)) {
+        if (resized) iris_image_free(resized);
+        return NULL;
+    }
+
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 0);
+    float *img_tensor = iris_image_to_tensor(img_to_use);
+    if (resized) iris_image_free(resized);
+
+    if (!img_tensor) {
+        set_error("Failed to convert input image to tensor");
+        return NULL;
+    }
+
+    int latent_h, latent_w;
+    float *img_latent = NULL;
+
+    if (ctx->vae) {
+        img_latent = iris_vae_encode(ctx->vae, img_tensor, 1,
+                                     ref_h, ref_w, &latent_h, &latent_w);
+    } else {
+        latent_h = ref_h / 16;
+        latent_w = ref_w / 16;
+        img_latent = (float *)calloc(IRIS_LATENT_CHANNELS * latent_h * latent_w, sizeof(float));
+    }
+
+    free(img_tensor);
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 1);
+
+    if (!img_latent) {
+        set_error("Failed to encode image");
+        return NULL;
+    }
+
+    int num_steps = p.num_steps;
+    int out_lat_h = p.height / 16;
+    int out_lat_w = p.width / 16;
+    int image_seq_len = out_lat_h * out_lat_w;
+
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
+
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+
+    int t_offset = 10;
+    float *latent = iris_sample_euler_refs_flux(
+        ctx->transformer, ctx->qwen3_encoder,
+        z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
+        img_latent, latent_h, latent_w,
+        t_offset,
+        text_emb, text_seq,
+        schedule, num_steps,
+        NULL
+    );
+
+    free(z);
+    free(img_latent);
+    free(schedule);
+
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    iris_image *result = NULL;
+    if (ctx->vae) {
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, out_lat_h, out_lat_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    }
+
+    free(latent);
+    return result;
+}
+
 /* Image-to-image generation via in-context conditioning. The reference image
  * is VAE-encoded into latent tokens with a RoPE T offset (T=10), while the
  * target starts from pure noise (T=0). Both are concatenated and fed to the

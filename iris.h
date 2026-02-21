@@ -164,6 +164,22 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
                          const iris_image *input, const iris_params *params);
 
 /*
+ * Image-to-image generation with pre-computed embeddings.
+ * Mirrors iris_img2img() but skips prompt tokenization/encoding so callers can
+ * reuse embeddings across repeated generations.
+ *
+ * Note: like iris_generate_with_embeddings(), this API only supports
+ * distilled models (no CFG path).
+ */
+iris_image *iris_img2img_with_embeddings(
+    iris_ctx *ctx,
+    const float *text_emb,
+    int text_seq,
+    const iris_image *input,
+    const iris_params *params
+);
+
+/*
  * Multi-reference generation (up to 4 reference images for klein).
  */
 iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
