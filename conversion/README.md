@@ -52,12 +52,12 @@ Exit codes:
 - `0`: required keys found
 - `2`: one or more required keys missing
 
-## Merge a LoRA into a copied transformer (offline bake)
+## Merge a LoRA/LoKR adapter into a copied transformer (offline bake)
 
 ```bash
 uv run python merge_flux2_lora.py \
   --model-dir /absolute/path/to/flux-klein-model \
-  --lora /absolute/path/to/lora.safetensors \
+  --lora /absolute/path/to/adapter.safetensors \
   --out /absolute/path/to/merged/transformer \
   --lora-scale 1.0
 ```
@@ -71,6 +71,8 @@ Notes:
 - The merge script follows `flux2.c` LoRA key-matching behavior:
   unknown key roots, `lora_A/B` and `lora_down/up`, and fallback aliases like
   `double_blocks.*` and `single_blocks.*`.
+- LoKR adapters (`lokr_w1`/`lokr_w2` style, including decomposed variants) are
+  also supported for offline baking.
 - For maximum merge precision use `--dtype float32`; for smaller output and
   mmap-friendly runtime use `--dtype bfloat16` (default).
 

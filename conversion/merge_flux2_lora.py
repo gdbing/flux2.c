@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Merge a FLUX LoRA into a copied Diffusers transformer directory.
+Merge a FLUX adapter into a copied Diffusers transformer directory.
+
+Supported adapter formats:
+- LoRA (lora_A/lora_B or lora_down/lora_up)
+- LoKR (lokr_w1/lokr_w2 and decomposed variants)
 
 This script ports the key-matching behavior from flux2.c's C LoRA loader:
 - Suffix-based module matching with unknown key roots.
-- Support for both lora_A/lora_B and lora_down/lora_up naming.
-- Fallback aliases for non-standard FLUX LoRA module names.
+- Fallback aliases for non-standard FLUX module names.
 - Fallback split for combined qkv adapters used by some trainers.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,7 +48,7 @@ class MergeStats:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Fuse a LoRA into a FLUX transformer and save merged weights."
+        description="Fuse a LoRA/LoKR adapter into a FLUX transformer and save merged weights."
     )
     p.add_argument(
         "--model-dir",
@@ -52,9 +56,14 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to model root (contains transformer/) or transformer directory directly.",
     )
-    p.add_argument("--lora", type=Path, required=True, help="Path to LoRA .safetensors file")
+    p.add_argument(
+        "--lora",
+        type=Path,
+        required=True,
+        help="Path to adapter .safetensors file (LoRA or LoKR)",
+    )
     p.add_argument("--out", type=Path, required=True, help="Output merged transformer directory")
-    p.add_argument("--lora-scale", type=float, default=1.0, help="LoRA scale for fusion")
+    p.add_argument("--lora-scale", type=float, default=1.0, help="Adapter scale for fusion")
     p.add_argument(
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
@@ -362,6 +371,368 @@ def normalize_lora_state_dict(
     return out, stats
 
 
+def detect_adapter_format(raw: dict[str, torch.Tensor]) -> str:
+    keys = raw.keys()
+    if any(".lora_A" in k or ".lora_B" in k or ".lora_down" in k or ".lora_up" in k for k in keys):
+        return "lora"
+    if any(".lokr_w1" in k or ".lokr_w2" in k for k in keys):
+        return "lokr"
+    if any(".hada_w1_a" in k or ".hada_w1_b" in k or ".hada_w2_a" in k or ".hada_w2_b" in k for k in keys):
+        return "loha"
+    return "unknown"
+
+
+LOKR_SUFFIXES = (
+    "lokr_w1",
+    "lokr_w1_a",
+    "lokr_w1_b",
+    "lokr_w2",
+    "lokr_w2_a",
+    "lokr_w2_b",
+    "lokr_t1",
+    "lokr_t2",
+    "alpha",
+)
+
+
+@dataclass(frozen=True)
+class LokrModule:
+    module: str
+    keys: dict[str, str]
+    tensors: dict[str, torch.Tensor | None]
+
+
+def find_lokr_module(
+    state_dict: dict[str, torch.Tensor],
+    module: str,
+) -> LokrModule | None:
+    by_root: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+    for key, tensor in state_dict.items():
+        for suffix in LOKR_SUFFIXES:
+            target = f"{module}.{suffix}"
+            if not key.endswith(target):
+                continue
+            root = key[: -len(target)]
+            if root and not root.endswith("."):
+                continue
+            root_bucket = by_root.setdefault(root, {})
+            if suffix in root_bucket:
+                raise ValueError(
+                    f"Duplicate LoKR tensor for module {module} and suffix {suffix} under root {root!r}"
+                )
+            root_bucket[suffix] = (key, tensor)
+            break
+
+    if not by_root:
+        return None
+
+    def root_is_valid(bucket: dict[str, tuple[str, torch.Tensor]]) -> bool:
+        has_w1 = ("lokr_w1" in bucket) or (
+            "lokr_w1_a" in bucket and "lokr_w1_b" in bucket
+        )
+        has_w2 = ("lokr_w2" in bucket) or (
+            "lokr_w2_a" in bucket and "lokr_w2_b" in bucket
+        )
+        return has_w1 and has_w2
+
+    valid_roots = [root for root, bucket in by_root.items() if root_is_valid(bucket)]
+    if not valid_roots:
+        details = ", ".join(
+            f"{root!r}:{sorted(bucket.keys())}" for root, bucket in sorted(by_root.items())
+        )
+        raise ValueError(
+            f"LoKR module {module} has incomplete tensors across roots: {details}"
+        )
+
+    if len(valid_roots) == 1:
+        chosen_root = valid_roots[0]
+    elif "" in valid_roots:
+        chosen_root = ""
+    else:
+        details = ", ".join(repr(root) for root in valid_roots)
+        raise ValueError(
+            f"LoKR module {module} is ambiguous across roots: {details}"
+        )
+
+    bucket = by_root[chosen_root]
+    keys: dict[str, str] = {}
+    tensors: dict[str, torch.Tensor | None] = {}
+    for suffix in LOKR_SUFFIXES:
+        if suffix in bucket:
+            key, tensor = bucket[suffix]
+            keys[suffix] = key
+            tensors[suffix] = tensor
+        else:
+            tensors[suffix] = None
+
+    return LokrModule(module=module, keys=keys, tensors=tensors)
+
+
+def cp_weight(wa: torch.Tensor, wb: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    if t.ndim != 4:
+        raise ValueError(
+            f"Unsupported LoKR tensor rank for CP rebuild: expected 4-D, got {tuple(t.shape)}"
+        )
+    temp = torch.einsum("i j k l, j r -> i r k l", t, wb)
+    return torch.einsum("i j k l, i r -> r j k l", temp, wa)
+
+
+def rebuild_lokr_delta(
+    lokr: LokrModule,
+    target_shape: tuple[int, ...],
+    base_scale: float,
+) -> torch.Tensor:
+    tensors = lokr.tensors
+    w1 = tensors["lokr_w1"]
+    w1a = tensors["lokr_w1_a"]
+    w1b = tensors["lokr_w1_b"]
+    w2 = tensors["lokr_w2"]
+    w2a = tensors["lokr_w2_a"]
+    w2b = tensors["lokr_w2_b"]
+    t1 = tensors["lokr_t1"]
+    t2 = tensors["lokr_t2"]
+    alpha = tensors["alpha"]
+
+    if w1 is None:
+        if w1a is None or w1b is None:
+            raise ValueError(f"LoKR module {lokr.module} is missing w1 tensors")
+        if t1 is not None:
+            w1 = cp_weight(w1a.float(), w1b.float(), t1.float())
+        else:
+            w1 = w1a.float() @ w1b.float()
+    else:
+        w1 = w1.float()
+
+    if w2 is None:
+        if w2a is None or w2b is None:
+            raise ValueError(f"LoKR module {lokr.module} is missing w2 tensors")
+        if t2 is not None:
+            w2 = cp_weight(w2a.float(), w2b.float(), t2.float())
+        else:
+            w2 = w2a.float() @ w2b.float()
+    else:
+        w2 = w2.float()
+
+    scale = base_scale
+    if alpha is not None and (w1b is not None or w2b is not None):
+        if alpha.numel() != 1:
+            raise ValueError(
+                f"LoKR alpha for {lokr.module} must be scalar, got {tuple(alpha.shape)}"
+            )
+        rank = int(w1b.shape[0]) if w1b is not None else int(w2b.shape[0])
+        scale *= float(alpha.reshape(-1).float()[0].item()) / float(rank)
+
+    rebuild = torch.kron(w1, w2)
+    expected = math.prod(target_shape)
+    if rebuild.numel() != expected:
+        raise ValueError(
+            f"LoKR shape mismatch for {lokr.module}: kron({tuple(w1.shape)}, {tuple(w2.shape)}) "
+            f"has {rebuild.numel()} elements, expected {expected} for target {target_shape}"
+        )
+    return rebuild.reshape(target_shape) * scale
+
+
+def merge_lokr_into_transformer(
+    model: Flux2Transformer2DModel,
+    raw: dict[str, torch.Tensor],
+    num_double_layers: int,
+    num_single_layers: int,
+    scale: float,
+) -> MergeStats:
+    params = dict(model.named_parameters())
+    used_keys: set[str] = set()
+    stats = MergeStats(source_tensors_total=len(raw))
+
+    def apply_delta(param_name: str, delta: torch.Tensor) -> None:
+        w = params[param_name]
+        if tuple(w.shape) != tuple(delta.shape):
+            raise ValueError(
+                f"Update shape mismatch for {param_name}: {tuple(delta.shape)} vs {tuple(w.shape)}"
+            )
+        merged = w.data.float() + delta.float()
+        w.data.copy_(merged.to(dtype=w.dtype))
+
+    def add_from_source(dest_module: str, source_module: str) -> bool:
+        lokr = find_lokr_module(raw, source_module)
+        if lokr is None:
+            return False
+        param_name = f"{dest_module}.weight"
+        if param_name not in params:
+            raise ValueError(f"Transformer parameter not found: {param_name}")
+        delta = rebuild_lokr_delta(lokr, tuple(params[param_name].shape), scale)
+        apply_delta(param_name, delta)
+        used_keys.update(lokr.keys.values())
+        stats.modules_applied += 1
+        return True
+
+    def add_qkv_fallback(source_module: str, dest_modules: tuple[str, str, str]) -> bool:
+        lokr = find_lokr_module(raw, source_module)
+        if lokr is None:
+            return False
+
+        q_name = f"{dest_modules[0]}.weight"
+        k_name = f"{dest_modules[1]}.weight"
+        v_name = f"{dest_modules[2]}.weight"
+        if q_name not in params or k_name not in params or v_name not in params:
+            raise ValueError(
+                f"Transformer qkv destination missing for source {source_module}: "
+                f"{q_name}, {k_name}, {v_name}"
+            )
+        q_shape = tuple(params[q_name].shape)
+        k_shape = tuple(params[k_name].shape)
+        v_shape = tuple(params[v_name].shape)
+        if q_shape != k_shape or q_shape != v_shape:
+            raise ValueError(
+                f"Expected matching q/k/v shapes for {source_module}, got {q_shape} {k_shape} {v_shape}"
+            )
+
+        full_shape = (q_shape[0] * 3, q_shape[1])
+        delta = rebuild_lokr_delta(lokr, full_shape, scale)
+        split = q_shape[0]
+        q_delta = delta[0:split, :]
+        k_delta = delta[split : split * 2, :]
+        v_delta = delta[split * 2 : split * 3, :]
+
+        for dest_name, part in ((q_name, q_delta), (k_name, k_delta), (v_name, v_delta)):
+            apply_delta(dest_name, part)
+            stats.modules_applied += 1
+
+        used_keys.update(lokr.keys.values())
+        return True
+
+    # Shared modules.
+    for module in (
+        "x_embedder",
+        "context_embedder",
+        "double_stream_modulation_img.linear",
+        "double_stream_modulation_txt.linear",
+        "single_stream_modulation.linear",
+        "proj_out",
+    ):
+        add_from_source(module, module)
+
+    for i in range(num_double_layers):
+        q = add_from_source(
+            f"transformer_blocks.{i}.attn.to_q",
+            f"transformer_blocks.{i}.attn.to_q",
+        )
+        k = add_from_source(
+            f"transformer_blocks.{i}.attn.to_k",
+            f"transformer_blocks.{i}.attn.to_k",
+        )
+        v = add_from_source(
+            f"transformer_blocks.{i}.attn.to_v",
+            f"transformer_blocks.{i}.attn.to_v",
+        )
+        if not (q or k or v):
+            add_qkv_fallback(
+                f"double_blocks.{i}.img_attn.qkv",
+                (
+                    f"transformer_blocks.{i}.attn.to_q",
+                    f"transformer_blocks.{i}.attn.to_k",
+                    f"transformer_blocks.{i}.attn.to_v",
+                ),
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.attn.to_out.0",
+            f"transformer_blocks.{i}.attn.to_out.0",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.attn.to_out.0",
+                f"double_blocks.{i}.img_attn.proj",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff.linear_in",
+            f"transformer_blocks.{i}.ff.linear_in",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff.linear_in",
+                f"double_blocks.{i}.img_mlp.0",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff.linear_out",
+            f"transformer_blocks.{i}.ff.linear_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff.linear_out",
+                f"double_blocks.{i}.img_mlp.2",
+            )
+
+        q = add_from_source(
+            f"transformer_blocks.{i}.attn.add_q_proj",
+            f"transformer_blocks.{i}.attn.add_q_proj",
+        )
+        k = add_from_source(
+            f"transformer_blocks.{i}.attn.add_k_proj",
+            f"transformer_blocks.{i}.attn.add_k_proj",
+        )
+        v = add_from_source(
+            f"transformer_blocks.{i}.attn.add_v_proj",
+            f"transformer_blocks.{i}.attn.add_v_proj",
+        )
+        if not (q or k or v):
+            add_qkv_fallback(
+                f"double_blocks.{i}.txt_attn.qkv",
+                (
+                    f"transformer_blocks.{i}.attn.add_q_proj",
+                    f"transformer_blocks.{i}.attn.add_k_proj",
+                    f"transformer_blocks.{i}.attn.add_v_proj",
+                ),
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.attn.to_add_out",
+            f"transformer_blocks.{i}.attn.to_add_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.attn.to_add_out",
+                f"double_blocks.{i}.txt_attn.proj",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff_context.linear_in",
+            f"transformer_blocks.{i}.ff_context.linear_in",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff_context.linear_in",
+                f"double_blocks.{i}.txt_mlp.0",
+            )
+
+        if not add_from_source(
+            f"transformer_blocks.{i}.ff_context.linear_out",
+            f"transformer_blocks.{i}.ff_context.linear_out",
+        ):
+            add_from_source(
+                f"transformer_blocks.{i}.ff_context.linear_out",
+                f"double_blocks.{i}.txt_mlp.2",
+            )
+
+    for i in range(num_single_layers):
+        if not add_from_source(
+            f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+            f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+        ):
+            add_from_source(
+                f"single_transformer_blocks.{i}.attn.to_qkv_mlp_proj",
+                f"single_blocks.{i}.linear1",
+            )
+
+        if not add_from_source(
+            f"single_transformer_blocks.{i}.attn.to_out",
+            f"single_transformer_blocks.{i}.attn.to_out",
+        ):
+            add_from_source(
+                f"single_transformer_blocks.{i}.attn.to_out",
+                f"single_blocks.{i}.linear2",
+            )
+
+    stats.source_tensors_used = len(used_keys)
+    return stats
+
+
 def merge_lora_into_transformer(
     model: Flux2Transformer2DModel,
     normalized_lora: dict[str, torch.Tensor],
@@ -445,30 +816,55 @@ def main() -> None:
     num_single = len(model.single_transformer_blocks)
     print(f"Transformer blocks: double={num_double} single={num_single}")
 
-    print("Reading and normalizing LoRA keys...")
+    print("Reading adapter tensors...")
     raw_lora = load_file(str(lora_path))
-    normalized_lora, stats = normalize_lora_state_dict(
-        raw_lora,
-        num_double_layers=num_double,
-        num_single_layers=num_single,
-    )
+    adapter_format = detect_adapter_format(raw_lora)
+    print(f"Detected adapter format: {adapter_format}")
 
-    if not normalized_lora:
-        raise RuntimeError("LoRA applied to 0 modules (no matching keys found)")
+    if adapter_format == "lora":
+        normalized_lora, stats = normalize_lora_state_dict(
+            raw_lora,
+            num_double_layers=num_double,
+            num_single_layers=num_single,
+        )
+        if not normalized_lora:
+            raise RuntimeError("LoRA applied to 0 modules (no matching keys found)")
 
-    print(
-        "Normalized LoRA: "
-        f"{len(normalized_lora)} tensors for {stats.modules_applied} modules "
-        f"(used {stats.source_tensors_used}/{stats.source_tensors_total} source tensors)"
-    )
-
-    print("Merging LoRA into transformer weights...")
-    merged_count = merge_lora_into_transformer(
-        model=model,
-        normalized_lora=normalized_lora,
-        scale=args.lora_scale,
-    )
-    print(f"Merged LoRA into {merged_count} transformer modules.")
+        print(
+            "Normalized LoRA: "
+            f"{len(normalized_lora)} tensors for {stats.modules_applied} modules "
+            f"(used {stats.source_tensors_used}/{stats.source_tensors_total} source tensors)"
+        )
+        print("Merging LoRA into transformer weights...")
+        merged_count = merge_lora_into_transformer(
+            model=model,
+            normalized_lora=normalized_lora,
+            scale=args.lora_scale,
+        )
+        print(f"Merged LoRA into {merged_count} transformer modules.")
+    elif adapter_format == "lokr":
+        print("Merging LoKR into transformer weights...")
+        stats = merge_lokr_into_transformer(
+            model=model,
+            raw=raw_lora,
+            num_double_layers=num_double,
+            num_single_layers=num_single,
+            scale=args.lora_scale,
+        )
+        if stats.modules_applied == 0:
+            raise RuntimeError("LoKR applied to 0 modules (no matching keys found)")
+        print(
+            "Resolved LoKR: "
+            f"{stats.modules_applied} modules "
+            f"(used {stats.source_tensors_used}/{stats.source_tensors_total} source tensors)"
+        )
+        print(f"Merged LoKR into {stats.modules_applied} transformer modules.")
+    elif adapter_format == "loha":
+        raise RuntimeError("LoHa adapters are not supported by this tool yet")
+    else:
+        raise RuntimeError(
+            "Adapter format not recognized. Supported formats: LoRA and LoKR."
+        )
 
     print("Saving merged transformer...")
     out_dir.mkdir(parents=True, exist_ok=True)
