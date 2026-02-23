@@ -289,6 +289,15 @@ typedef void (*iris_step_image_cb_t)(int step, int total, const iris_image *img)
 void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback);
 
 /*
+ * Set progress callbacks for denoising steps and phase transitions.
+ * Pass NULL to disable.
+ */
+typedef void (*iris_step_cb_t)(int step, int total);
+typedef void (*iris_phase_cb_t)(const char *phase, int done);
+void iris_set_step_callback(iris_step_cb_t callback);
+void iris_set_phase_callback(iris_phase_cb_t callback);
+
+/*
  * Cooperative cancellation for in-progress generation.
  * A cancel request is checked between sampling steps.
  */

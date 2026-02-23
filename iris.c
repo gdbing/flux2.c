@@ -232,6 +232,14 @@ void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback) 
     iris_step_image_vae = callback ? ctx->vae : NULL;
 }
 
+void iris_set_step_callback(iris_step_cb_t callback) {
+    iris_step_callback = callback;
+}
+
+void iris_set_phase_callback(iris_phase_cb_t callback) {
+    iris_phase_callback = callback;
+}
+
 static void set_error(const char *msg) {
     strncpy(g_error_msg, msg, sizeof(g_error_msg) - 1);
     g_error_msg[sizeof(g_error_msg) - 1] = '\0';
