@@ -1203,13 +1203,67 @@ iris_image *iris_img2img_with_embeddings(
         set_error("Invalid context, embeddings, or input image");
         return NULL;
     }
+    iris_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (iris_params)IRIS_PARAMS_DEFAULT;
+    }
+
+    if (p.width <= 0) p.width = input->width;
+    if (p.height <= 0) p.height = input->height;
+
+    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
+        float scale = (float)IRIS_VAE_MAX_DIM /
+                      (p.width > p.height ? p.width : p.height);
+        p.width = (int)(p.width * scale);
+        p.height = (int)(p.height * scale);
+    }
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+
+    int out_lat_h = p.height / 16;
+    int out_lat_w = p.width / 16;
+    int noise_size = IRIS_LATENT_CHANNELS * out_lat_h * out_lat_w;
+
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *noise = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+    if (!noise) {
+        set_error("Failed to initialize noise");
+        return NULL;
+    }
+
+    iris_image *result = iris_img2img_with_embeddings_and_noise(
+        ctx, text_emb, text_seq, input, noise, noise_size, &p
+    );
+    free(noise);
+    return result;
+}
+
+/* Image-to-image generation with pre-computed text embeddings and external
+ * target latent noise. The reference image is still used as in-context
+ * conditioning tokens; only the target initialization is caller-controlled. */
+iris_image *iris_img2img_with_embeddings_and_noise(
+    iris_ctx *ctx,
+    const float *text_emb,
+    int text_seq,
+    const iris_image *input,
+    const float *noise,
+    int noise_size,
+    const iris_params *params
+) {
+    if (!ctx || !text_emb || text_seq <= 0 || !input || !noise) {
+        set_error("Invalid context, embeddings, input image, or noise");
+        return NULL;
+    }
     if (ctx->is_zimage) {
         set_error("img2img is not supported for Z-Image");
         return NULL;
     }
 
     if (!ctx->is_distilled) {
-        fprintf(stderr, "Warning: iris_img2img_with_embeddings() does not "
+        fprintf(stderr, "Warning: iris_img2img_with_embeddings* APIs do not "
                         "support CFG. Use iris_img2img() for base models.\n");
     }
 
@@ -1299,11 +1353,21 @@ iris_image *iris_img2img_with_embeddings(
     int out_lat_h = p.height / 16;
     int out_lat_w = p.width / 16;
     int image_seq_len = out_lat_h * out_lat_w;
+    int expected_noise_size = IRIS_LATENT_CHANNELS * out_lat_h * out_lat_w;
+
+    if (noise_size != expected_noise_size) {
+        char err[256];
+        snprintf(err, sizeof(err), "Noise size mismatch: got %d, expected %d",
+                 noise_size, expected_noise_size);
+        set_error(err);
+        free(img_latent);
+        return NULL;
+    }
 
     float *schedule = iris_selected_schedule(&p, image_seq_len);
 
-    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
-    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+    float *z = (float *)malloc(expected_noise_size * sizeof(float));
+    memcpy(z, noise, expected_noise_size * sizeof(float));
 
     int t_offset = 10;
     float *latent = iris_sample_euler_refs_flux(
@@ -1839,6 +1903,40 @@ iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
     iris_image *img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
     if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     return img;
+}
+
+float *iris_noise_latent(const float *latent, int latent_h, int latent_w,
+                         float strength, int64_t seed) {
+    if (!latent || latent_h <= 0 || latent_w <= 0) {
+        set_error("Invalid latent tensor");
+        return NULL;
+    }
+    if (strength < 0.0f || strength > 1.0f) {
+        set_error("Strength must be in [0, 1]");
+        return NULL;
+    }
+
+    int latent_size = IRIS_LATENT_CHANNELS * latent_h * latent_w;
+    float *noise = iris_init_noise(1, IRIS_LATENT_CHANNELS, latent_h, latent_w, seed);
+    if (!noise) {
+        set_error("Failed to initialize noise");
+        return NULL;
+    }
+
+    float *mixed = (float *)malloc(latent_size * sizeof(float));
+    if (!mixed) {
+        free(noise);
+        set_error("Out of memory");
+        return NULL;
+    }
+
+    float keep = 1.0f - strength;
+    for (int i = 0; i < latent_size; i++) {
+        mixed[i] = keep * latent[i] + strength * noise[i];
+    }
+
+    free(noise);
+    return mixed;
 }
 
 float *iris_denoise_step(iris_ctx *ctx, const float *z, float t,

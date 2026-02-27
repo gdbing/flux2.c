@@ -180,6 +180,27 @@ iris_image *iris_img2img_with_embeddings(
 );
 
 /*
+ * Image-to-image generation with pre-computed embeddings and external noise.
+ * Mirrors iris_img2img_with_embeddings() but uses caller-provided initial
+ * target latent noise instead of generating random noise from seed.
+ *
+ * noise: [latent_channels, height/16, width/16] in NCHW format
+ * noise_size: total number of floats in noise array
+ *
+ * Note: like iris_generate_with_embeddings(), this API only supports
+ * distilled models (no CFG path).
+ */
+iris_image *iris_img2img_with_embeddings_and_noise(
+    iris_ctx *ctx,
+    const float *text_emb,
+    int text_seq,
+    const iris_image *input,
+    const float *noise,
+    int noise_size,
+    const iris_params *params
+);
+
+/*
  * Multi-reference generation (up to 4 reference images for klein).
  */
 iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
@@ -316,6 +337,15 @@ int iris_cancel_requested(void);
  */
 float *iris_encode_image(iris_ctx *ctx, const iris_image *img,
                          int *out_h, int *out_w);
+
+/*
+ * Mix a Flux latent with Gaussian noise using img2img-style strength.
+ * strength=0.0 keeps the latent, strength=1.0 returns pure Gaussian noise.
+ * Returns newly allocated latent [1, 128, latent_h, latent_w].
+ * Caller must free() the returned pointer.
+ */
+float *iris_noise_latent(const float *latent, int latent_h, int latent_w,
+                         float strength, int64_t seed);
 
 /*
  * Decode latent to image using VAE decoder.
