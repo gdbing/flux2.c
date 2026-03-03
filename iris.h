@@ -187,23 +187,6 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
                           const iris_params *params);
 
 /*
- * Multi-reference generation with pre-computed embeddings.
- * Mirrors iris_multiref() but skips prompt tokenization/encoding so callers can
- * reuse embeddings across repeated generations.
- *
- * Note: like iris_generate_with_embeddings(), this API only supports
- * distilled models (no CFG path).
- */
-iris_image *iris_multiref_with_embeddings(
-    iris_ctx *ctx,
-    const float *text_emb,
-    int text_seq,
-    const iris_image **refs,
-    int num_refs,
-    const iris_params *params
-);
-
-/*
  * Debug: img2img using Python's exact inputs from /tmp/py_*.bin files.
  * Used for comparing C and Python implementations.
  */
