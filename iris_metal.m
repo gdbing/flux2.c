@@ -1551,6 +1551,11 @@ void iris_metal_attention(float *out,
             return;
         }
 
+        /* Result buffers come from the reusable pool. Zero them before
+         * MPSMatrixMultiplication with beta=0 to avoid stale NaN propagation. */
+        memset([bufScores contents], 0, sizeScores);
+        memset([bufOut contents], 0, sizeOut);
+
         /* Copy input data to GPU buffers */
         memcpy([bufQ contents], Q, sizeQ);
         memcpy([bufK contents], K, sizeK);
@@ -2877,6 +2882,10 @@ int iris_gpu_attention_mps_bf16(iris_gpu_tensor_t out,
         /* Allocate scores buffer (f16) */
         id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
         if (!bufScores) return 0;
+
+        /* Zero scores before MPS matmul. Pool buffers may contain stale bits
+         * from prior uses, which can propagate when beta=0 on some paths. */
+        memset([bufScores contents], 0, scores_size);
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
 
